@@ -1,0 +1,13 @@
+src/app/mistakes/index.tsx(3,93): error TS2307: Cannot find module '@/components/ui' or its corresponding type declarations.
+src/app/mistakes/index.tsx(161,35): error TS2345: Argument of type 'EventTarget & Element' is not assignable to parameter of type 'HTMLFormElement | undefined'.
+  Type 'EventTarget & Element' is missing the following properties from type 'HTMLFormElement': acceptCharset, action, autocomplete, elements, and 150 more.
+src/app/mistakes/index.tsx(180,35): error TS2345: Argument of type 'EventTarget & Element' is not assignable to parameter of type 'HTMLFormElement | undefined'.
+  Type 'EventTarget & Element' is missing the following properties from type 'HTMLFormElement': acceptCharset, action, autocomplete, elements, and 150 more.
+src/app/mistakes/index.tsx(306,26): error TS7006: Parameter 'e' implicitly has an 'any' type.
+src/app/mistakes/index.tsx(313,26): error TS7006: Parameter 'e' implicitly has an 'any' type.
+src/app/mistakes/index.tsx(324,26): error TS7006: Parameter 'e' implicitly has an 'any' type.
+src/app/mistakes/index.tsx(336,26): error TS7006: Parameter 'e' implicitly has an 'any' type.
+src/app/mistakes/index.tsx(347,26): error TS7006: Parameter 'e' implicitly has an 'any' type.
+src/app/mistakes/index.tsx(519,57): error TS7006: Parameter 'open' implicitly has an 'any' type.
+src/app/mistakes/index.tsx(669,30): error TS7006: Parameter 'e' implicitly has an 'any' type.
+src/app/mistakes/index.tsx(676,75): error TS7006: Parameter 'checked' implicitly has an 'any' type.
