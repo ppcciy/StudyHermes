@@ -51,7 +51,7 @@ export function LearningView(): React.ReactElement {
   }
 
   return (
-    <div className="flex flex-col gap-6 p-6">
+    <div className="flex min-h-0 flex-col overflow-y-auto gap-6 p-6">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold">学习目标</h1>
