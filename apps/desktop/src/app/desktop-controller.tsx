@@ -20,6 +20,7 @@ import { LearningView } from './learning'
 import { TasksView } from './tasks'
 import { StudyView } from './study'
 import { PlanningView } from './planning'
+import { MistakesView } from './mistakes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '../lib/chat-messages'
 import { storedSessionIdForNotification } from '../lib/session-ids'
 import { isMessagingSource } from '../lib/session-source'
@@ -1298,6 +1299,7 @@ export function DesktopController() {
           <Route element={<TasksView />} path="tasks" />
           <Route element={<StudyView />} path="study" />
           <Route element={<PlanningView />} path="planning" />
+          <Route element={<MistakesView />} path="mistakes" />
           <Route element={chatView} path="chat" />
           <Route element={chatView} path="chat/:sessionId" />
           <Route

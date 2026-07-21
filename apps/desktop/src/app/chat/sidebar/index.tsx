@@ -162,6 +162,12 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
     route: '/planning'
   },
   {
+    id: 'mistakes',
+    label: '错题本',
+    icon: props => <Codicon name="bookmark" {...props} />,
+    route: '/mistakes'
+  },
+  {
     id: 'new-session',
     label: 'AI 问答',
     icon: props => <Codicon name="robot" {...props} />,

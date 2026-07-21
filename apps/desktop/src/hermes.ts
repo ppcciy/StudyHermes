@@ -1318,3 +1318,129 @@ export function updateTaskStatus(taskId: string, status: string): Promise<DailyT
     body: { status }
   })
 }
+
+export interface WrongQuestion {
+  id: string
+  subject: string
+  knowledge_point: string
+  question_content: string
+  user_answer: string
+  correct_answer: string
+  error_type: string
+  difficulty: string
+  mastery_status: string
+  error_analysis: string
+  solution: string
+  tags: string[]
+  image_path: string | null
+  source_file: string | null
+  created_at: string
+  updated_at: string
+  review_count: number
+  correct_count: number
+  last_review_at: string | null
+  next_review_at: string | null
+}
+
+export interface WrongQuestionStats {
+  total: number
+  by_subject: Record<string, number>
+  by_knowledge: Record<string, number>
+  by_error_type: Record<string, number>
+  by_mastery: Record<string, number>
+  need_review: number
+}
+
+export interface ReviewQuestionRequest {
+  user_answer: string
+  is_correct: boolean
+  time_spent_seconds?: number
+  notes?: string
+}
+
+export interface ReviewQuestionResponse {
+  message: string
+  review_id: string
+  mastery_status: string
+  next_review_at: string
+}
+
+export function getWrongQuestions(params?: {
+  subject?: string
+  knowledge_point?: string
+  error_type?: string
+  difficulty?: string
+  mastery_status?: string
+}): Promise<WrongQuestion[]> {
+  const query = new URLSearchParams()
+  if (params?.subject) query.set('subject', params.subject)
+  if (params?.knowledge_point) query.set('knowledge_point', params.knowledge_point)
+  if (params?.error_type) query.set('error_type', params.error_type)
+  if (params?.difficulty) query.set('difficulty', params.difficulty)
+  if (params?.mastery_status) query.set('mastery_status', params.mastery_status)
+
+  return window.hermesDesktop.api<WrongQuestion[]>({
+    ...profileScoped(),
+    path: `/api/learning/wrong-questions?${query.toString()}`
+  })
+}
+
+export function getWrongQuestionStats(): Promise<WrongQuestionStats> {
+  return window.hermesDesktop.api<WrongQuestionStats>({
+    ...profileScoped(),
+    path: '/api/learning/wrong-questions/stats'
+  })
+}
+
+export function getQuestionsNeedReview(): Promise<WrongQuestion[]> {
+  return window.hermesDesktop.api<WrongQuestion[]>({
+    ...profileScoped(),
+    path: '/api/learning/wrong-questions/need-review'
+  })
+}
+
+export function createWrongQuestion(data: {
+  subject: string
+  knowledge_point: string
+  question_content: string
+  user_answer: string
+  correct_answer: string
+  error_type: string
+  difficulty?: string
+  error_analysis?: string
+  solution?: string
+  tags?: string[]
+}): Promise<WrongQuestion> {
+  return window.hermesDesktop.api<WrongQuestion>({
+    ...profileScoped(),
+    path: '/api/learning/wrong-questions',
+    method: 'POST',
+    body: data
+  })
+}
+
+export function updateWrongQuestion(questionId: string, data: Partial<WrongQuestion>): Promise<WrongQuestion> {
+  return window.hermesDesktop.api<WrongQuestion>({
+    ...profileScoped(),
+    path: `/api/learning/wrong-questions/${encodeURIComponent(questionId)}`,
+    method: 'PUT',
+    body: data
+  })
+}
+
+export function deleteWrongQuestion(questionId: string): Promise<{ message: string }> {
+  return window.hermesDesktop.api<{ message: string }>({
+    ...profileScoped(),
+    path: `/api/learning/wrong-questions/${encodeURIComponent(questionId)}`,
+    method: 'DELETE'
+  })
+}
+
+export function reviewWrongQuestion(questionId: string, data: ReviewQuestionRequest): Promise<ReviewQuestionResponse> {
+  return window.hermesDesktop.api<ReviewQuestionResponse>({
+    ...profileScoped(),
+    path: `/api/learning/wrong-questions/${encodeURIComponent(questionId)}/review`,
+    method: 'POST',
+    body: data
+  })
+}

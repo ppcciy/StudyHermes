@@ -13,11 +13,13 @@ from pydantic import BaseModel, Field
 from hermes_cli.config import get_hermes_home
 from agent.learning_models import (
     DailyTask,
+    ErrorType,
     LearningGoal,
     LearningGoalStatus,
     LearningGoalType,
     LearningPlan,
     LearningStats,
+    MasteryStatus,
     TaskDifficulty,
     TaskStatus,
 )
@@ -727,3 +729,322 @@ async def generate_learning_plan(request: Request, body: GeneratePlanRequest):
         "total_plans": len(template["plans"]),
         "total_tasks": sum(len(p["tasks"]) for p in template["plans"]),
     }
+
+
+def _load_wrong_questions() -> Dict[str, Dict[str, Any]]:
+    path = _LEARNING_DATA_DIR / "wrong_questions.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return {}
+
+
+def _save_wrong_questions(questions: Dict[str, Dict[str, Any]]) -> None:
+    path = _LEARNING_DATA_DIR / "wrong_questions.json"
+    path.write_text(json.dumps(questions, indent=2), encoding="utf-8")
+
+
+def _load_question_reviews() -> Dict[str, Dict[str, Any]]:
+    path = _LEARNING_DATA_DIR / "question_reviews.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return {}
+
+
+def _save_question_reviews(reviews: Dict[str, Dict[str, Any]]) -> None:
+    path = _LEARNING_DATA_DIR / "question_reviews.json"
+    path.write_text(json.dumps(reviews, indent=2), encoding="utf-8")
+
+
+def _load_similar_questions() -> Dict[str, Dict[str, Any]]:
+    path = _LEARNING_DATA_DIR / "similar_questions.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return {}
+
+
+def _save_similar_questions(questions: Dict[str, Dict[str, Any]]) -> None:
+    path = _LEARNING_DATA_DIR / "similar_questions.json"
+    path.write_text(json.dumps(questions, indent=2), encoding="utf-8")
+
+
+class CreateWrongQuestionRequest(BaseModel):
+    subject: str = Field(..., description="学科名称")
+    knowledge_point: str = Field(..., description="知识点")
+    question_content: str = Field(..., description="题目内容")
+    user_answer: str = Field(..., description="用户答案")
+    correct_answer: str = Field(..., description="正确答案")
+    error_type: str = Field(..., description="错误类型")
+    difficulty: str = Field(default="medium", description="难度")
+    error_analysis: str = Field(default="", description="错误分析")
+    solution: str = Field(default="", description="解题思路")
+    tags: List[str] = Field(default_factory=list)
+
+
+class UpdateWrongQuestionRequest(BaseModel):
+    subject: Optional[str] = None
+    knowledge_point: Optional[str] = None
+    question_content: Optional[str] = None
+    user_answer: Optional[str] = None
+    correct_answer: Optional[str] = None
+    error_type: Optional[str] = None
+    difficulty: Optional[str] = None
+    error_analysis: Optional[str] = None
+    solution: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+
+class ReviewQuestionRequest(BaseModel):
+    user_answer: str = Field(..., description="用户答案")
+    is_correct: bool = Field(..., description="是否正确")
+    time_spent_seconds: int = Field(default=0)
+    notes: str = Field(default="")
+
+
+@router.get("/wrong-questions", response_model=List[Dict[str, Any]])
+async def get_wrong_questions(
+    request: Request,
+    subject: Optional[str] = None,
+    knowledge_point: Optional[str] = None,
+    error_type: Optional[str] = None,
+    difficulty: Optional[str] = None,
+    mastery_status: Optional[str] = None,
+):
+    questions = _load_wrong_questions()
+    result = list(questions.values())
+
+    if subject:
+        result = [q for q in result if q["subject"] == subject]
+    if knowledge_point:
+        result = [q for q in result if q["knowledge_point"] == knowledge_point]
+    if error_type:
+        result = [q for q in result if q["error_type"] == error_type]
+    if difficulty:
+        result = [q for q in result if q["difficulty"] == difficulty]
+    if mastery_status:
+        result = [q for q in result if q["mastery_status"] == mastery_status]
+
+    result.sort(key=lambda q: q["created_at"], reverse=True)
+    return result
+
+
+@router.get("/wrong-questions/{question_id}", response_model=Dict[str, Any])
+async def get_wrong_question(request: Request, question_id: str):
+    questions = _load_wrong_questions()
+    if question_id not in questions:
+        raise HTTPException(status_code=404, detail="错题不存在")
+    return questions[question_id]
+
+
+@router.post("/wrong-questions", response_model=Dict[str, Any])
+async def create_wrong_question(request: Request, body: CreateWrongQuestionRequest):
+    questions = _load_wrong_questions()
+    now = datetime.now(timezone.utc)
+    question_id = _generate_id()
+
+    try:
+        ErrorType(body.error_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="无效的错误类型")
+
+    try:
+        TaskDifficulty(body.difficulty)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="无效的难度等级")
+
+    question: Dict[str, Any] = {
+        "id": question_id,
+        "subject": body.subject,
+        "knowledge_point": body.knowledge_point,
+        "question_content": body.question_content,
+        "user_answer": body.user_answer,
+        "correct_answer": body.correct_answer,
+        "error_type": body.error_type,
+        "difficulty": body.difficulty,
+        "mastery_status": "weak",
+        "error_analysis": body.error_analysis,
+        "solution": body.solution,
+        "tags": body.tags,
+        "image_path": None,
+        "source_file": None,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+        "review_count": 0,
+        "correct_count": 0,
+        "last_review_at": None,
+        "next_review_at": (now + timedelta(days=1)).isoformat(),
+    }
+
+    questions[question_id] = question
+    _save_wrong_questions(questions)
+
+    return question
+
+
+@router.put("/wrong-questions/{question_id}", response_model=Dict[str, Any])
+async def update_wrong_question(request: Request, question_id: str, body: UpdateWrongQuestionRequest):
+    questions = _load_wrong_questions()
+    if question_id not in questions:
+        raise HTTPException(status_code=404, detail="错题不存在")
+
+    question = questions[question_id]
+
+    if body.subject is not None:
+        question["subject"] = body.subject
+    if body.knowledge_point is not None:
+        question["knowledge_point"] = body.knowledge_point
+    if body.question_content is not None:
+        question["question_content"] = body.question_content
+    if body.user_answer is not None:
+        question["user_answer"] = body.user_answer
+    if body.correct_answer is not None:
+        question["correct_answer"] = body.correct_answer
+    if body.error_type is not None:
+        try:
+            ErrorType(body.error_type)
+            question["error_type"] = body.error_type
+        except ValueError:
+            raise HTTPException(status_code=400, detail="无效的错误类型")
+    if body.difficulty is not None:
+        try:
+            TaskDifficulty(body.difficulty)
+            question["difficulty"] = body.difficulty
+        except ValueError:
+            raise HTTPException(status_code=400, detail="无效的难度等级")
+    if body.error_analysis is not None:
+        question["error_analysis"] = body.error_analysis
+    if body.solution is not None:
+        question["solution"] = body.solution
+    if body.tags is not None:
+        question["tags"] = body.tags
+
+    question["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _save_wrong_questions(questions)
+
+    return question
+
+
+@router.delete("/wrong-questions/{question_id}")
+async def delete_wrong_question(request: Request, question_id: str):
+    questions = _load_wrong_questions()
+    if question_id not in questions:
+        raise HTTPException(status_code=404, detail="错题不存在")
+
+    del questions[question_id]
+    _save_wrong_questions(questions)
+
+    reviews = _load_question_reviews()
+    remaining_reviews = {rid: r for rid, r in reviews.items() if r["question_id"] != question_id}
+    _save_question_reviews(remaining_reviews)
+
+    similar = _load_similar_questions()
+    remaining_similar = {sid: s for sid, s in similar.items() if s["original_question_id"] != question_id}
+    _save_similar_questions(remaining_similar)
+
+    return {"message": "错题删除成功"}
+
+
+@router.post("/wrong-questions/{question_id}/review", response_model=Dict[str, Any])
+async def review_wrong_question(request: Request, question_id: str, body: ReviewQuestionRequest):
+    questions = _load_wrong_questions()
+    if question_id not in questions:
+        raise HTTPException(status_code=404, detail="错题不存在")
+
+    question = questions[question_id]
+    now = datetime.now(timezone.utc)
+
+    reviews = _load_question_reviews()
+    review_id = _generate_id()
+    review: Dict[str, Any] = {
+        "id": review_id,
+        "question_id": question_id,
+        "user_answer": body.user_answer,
+        "is_correct": body.is_correct,
+        "review_date": now.isoformat(),
+        "time_spent_seconds": body.time_spent_seconds,
+        "notes": body.notes,
+    }
+    reviews[review_id] = review
+    _save_question_reviews(reviews)
+
+    question["review_count"] += 1
+    question["last_review_at"] = now.isoformat()
+
+    if body.is_correct:
+        question["correct_count"] += 1
+        correct_rate = question["correct_count"] / question["review_count"]
+        if correct_rate >= 0.8:
+            question["mastery_status"] = "mastered"
+        elif correct_rate >= 0.6:
+            question["mastery_status"] = "proficient"
+        elif correct_rate >= 0.4:
+            question["mastery_status"] = "basic"
+        else:
+            question["mastery_status"] = "weak"
+
+        days_interval = min(int(question["review_count"] * 1.5), 30)
+        question["next_review_at"] = (now + timedelta(days=days_interval)).isoformat()
+    else:
+        question["mastery_status"] = "weak"
+        question["next_review_at"] = (now + timedelta(days=1)).isoformat()
+
+    question["updated_at"] = now.isoformat()
+    _save_wrong_questions(questions)
+
+    return {
+        "message": "复习记录已保存",
+        "review_id": review_id,
+        "mastery_status": question["mastery_status"],
+        "next_review_at": question["next_review_at"],
+    }
+
+
+@router.get("/wrong-questions/{question_id}/reviews", response_model=List[Dict[str, Any]])
+async def get_question_reviews(request: Request, question_id: str):
+    reviews = _load_question_reviews()
+    return [r for r in reviews.values() if r["question_id"] == question_id]
+
+
+@router.get("/wrong-questions/stats", response_model=Dict[str, Any])
+async def get_wrong_question_stats(request: Request):
+    questions = _load_wrong_questions()
+
+    total = len(questions)
+    by_subject: Dict[str, int] = {}
+    by_knowledge: Dict[str, int] = {}
+    by_error_type: Dict[str, int] = {}
+    by_mastery: Dict[str, int] = {}
+
+    for q in questions.values():
+        by_subject[q["subject"]] = by_subject.get(q["subject"], 0) + 1
+        by_knowledge[q["knowledge_point"]] = by_knowledge.get(q["knowledge_point"], 0) + 1
+        by_error_type[q["error_type"]] = by_error_type.get(q["error_type"], 0) + 1
+        by_mastery[q["mastery_status"]] = by_mastery.get(q["mastery_status"], 0) + 1
+
+    today = datetime.now(timezone.utc).date()
+    need_review = sum(
+        1 for q in questions.values()
+        if q["next_review_at"] and _parse_datetime(q["next_review_at"]).date() <= today
+    )
+
+    return {
+        "total": total,
+        "by_subject": by_subject,
+        "by_knowledge": by_knowledge,
+        "by_error_type": by_error_type,
+        "by_mastery": by_mastery,
+        "need_review": need_review,
+    }
+
+
+@router.get("/wrong-questions/need-review", response_model=List[Dict[str, Any]])
+async def get_questions_need_review(request: Request):
+    questions = _load_wrong_questions()
+    today = datetime.now(timezone.utc).date()
+
+    result = [
+        q for q in questions.values()
+        if q["next_review_at"] and _parse_datetime(q["next_review_at"]).date() <= today
+    ]
+
+    result.sort(key=lambda q: q["next_review_at"])
+    return result

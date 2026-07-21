@@ -1,7 +1,7 @@
 import type * as React from 'react'
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ArrowRight, Calendar, Flame, ListTodo, Sparkles, Code2, Layers, MessageSquare, BookOpen, Target, TrendingUp, Clock, Check, Loader2 } from '@/lib/icons'
+import { ArrowRight, Calendar, Flame, ListTodo, Sparkles, Code2, Layers, MessageSquare, BookOpen, Target, TrendingUp, Clock, Check, Loader2, BookMarked } from '@/lib/icons'
 import { getLearningStats, getTodayTasks, getLearningGoals, generateLearningPlan, updateTaskStatus, type LearningStats, type DailyTask, type LearningGoal, type GeneratePlanResponse } from '@/hermes'
 
 export function DashboardView(): React.ReactElement {
@@ -284,13 +284,14 @@ export function DashboardView(): React.ReactElement {
 
       <div className="bg-card rounded-xl p-5 border">
         <h3 className="font-semibold mb-4">快捷入口</h3>
-        <div className="grid grid-cols-5 gap-4">
+        <div className="grid grid-cols-6 gap-4">
           {[
             { icon: <Code2 className="w-6 h-6" />, label: 'AI 问答', color: 'bg-blue-100 text-blue-600', route: '/chat' },
             { icon: <Target className="w-6 h-6" />, label: '学习目标', color: 'bg-green-100 text-green-600', route: '/learning' },
             { icon: <ListTodo className="w-6 h-6" />, label: '任务管理', color: 'bg-amber-100 text-amber-600', route: '/tasks' },
             { icon: <Clock className="w-6 h-6" />, label: '专注学习', color: 'bg-purple-100 text-purple-600', route: '/study' },
             { icon: <Layers className="w-6 h-6" />, label: '学习计划', color: 'bg-pink-100 text-pink-600', route: '/planning' },
+            { icon: <BookMarked className="w-6 h-6" />, label: '错题本', color: 'bg-red-100 text-red-600', route: '/mistakes' },
           ].map((item, index) => (
             <button
               key={index}

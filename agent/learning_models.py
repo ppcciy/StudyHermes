@@ -41,6 +41,23 @@ class ReviewStatus(str, Enum):
     SCHEDULED = "scheduled"
 
 
+class ErrorType(str, Enum):
+    CONCEPT_MISUNDERSTANDING = "concept_misunderstanding"
+    CALCULATION_ERROR = "calculation_error"
+    MISREADING = "misreading"
+    CAREFLESS = "careless"
+    STRATEGY_ERROR = "strategy_error"
+    OTHER = "other"
+
+
+class MasteryStatus(str, Enum):
+    UNKNOWN = "unknown"
+    WEAK = "weak"
+    BASIC = "basic"
+    PROFICIENT = "proficient"
+    MASTERED = "mastered"
+
+
 @dataclass
 class LearningGoal:
     id: str
@@ -150,3 +167,49 @@ class LearningRecommendation:
     reason: str
     priority: int
     created_at: datetime
+
+
+@dataclass
+class WrongQuestion:
+    id: str
+    subject: str
+    knowledge_point: str
+    question_content: str
+    user_answer: str
+    correct_answer: str
+    error_type: ErrorType
+    difficulty: TaskDifficulty
+    mastery_status: MasteryStatus
+    error_analysis: str
+    solution: str
+    created_at: datetime
+    updated_at: datetime
+    tags: list[str] = field(default_factory=list)
+    image_path: Optional[str] = None
+    source_file: Optional[str] = None
+    review_count: int = 0
+    correct_count: int = 0
+    last_review_at: Optional[datetime] = None
+    next_review_at: Optional[datetime] = None
+
+
+@dataclass
+class WrongQuestionReview:
+    id: str
+    question_id: str
+    user_answer: str
+    is_correct: bool
+    review_date: datetime
+    time_spent_seconds: int = 0
+    notes: str = ""
+
+
+@dataclass
+class SimilarQuestion:
+    id: str
+    original_question_id: str
+    question_content: str
+    correct_answer: str
+    created_at: datetime
+    options: Optional[list[str]] = None
+    explanation: str = ""
