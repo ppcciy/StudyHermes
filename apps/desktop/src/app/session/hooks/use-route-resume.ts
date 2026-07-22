@@ -61,7 +61,14 @@ function rawHashLooksLikeSession(): boolean {
     !hash.startsWith('/settings') &&
     !hash.startsWith('/skills') &&
     !hash.startsWith('/messaging') &&
-    !hash.startsWith('/artifacts')
+    !hash.startsWith('/artifacts') &&
+    !hash.startsWith('/student-profile') &&
+    !hash.startsWith('/learning') &&
+    !hash.startsWith('/tasks') &&
+    !hash.startsWith('/study') &&
+    !hash.startsWith('/planning') &&
+    !hash.startsWith('/mistakes') &&
+    !hash.startsWith('/dashboard')
   )
 }
 

@@ -95,7 +95,7 @@ import {
   setCurrentCwd
 } from '@/store/session'
 
-import { type AppView, ARTIFACTS_ROUTE, MESSAGING_ROUTE, SKILLS_ROUTE } from '../../routes'
+import { type AppView, appViewForPath, ARTIFACTS_ROUTE, MESSAGING_ROUTE, SKILLS_ROUTE, STUDENT_PROFILE_ROUTE } from '../../routes'
 import type { SidebarNavItem } from '../../types'
 
 import { countLabel } from './chrome'
@@ -136,6 +136,12 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
     label: '首页',
     icon: props => <Codicon name="home" {...props} />,
     route: '/'
+  },
+  {
+    id: 'student-profile',
+    label: '个人信息',
+    icon: props => <Codicon name="account" {...props} />,
+    route: STUDENT_PROFILE_ROUTE
   },
   {
     id: 'learning',
@@ -1086,12 +1092,9 @@ export function ChatSidebar({
               {SIDEBAR_NAV.map(item => {
                 const isInteractive = Boolean(item.action) || Boolean(item.route)
 
-                const active =
-                  (item.id === 'skills' && currentView === 'skills') ||
-                  (item.id === 'messaging' && currentView === 'messaging') ||
-                  (item.id === 'artifacts' && currentView === 'artifacts')
-
                 const isNewSession = item.id === 'new-session'
+                const routeView = item.route ? appViewForPath(item.route) : null
+                const active = (routeView != null && routeView === currentView) || (isNewSession && currentView === 'chat')
 
                 return (
                   <SidebarMenuItem key={item.id}>

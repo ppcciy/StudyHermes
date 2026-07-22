@@ -38,9 +38,9 @@ export function ChatDropOverlay({ kind }: { kind: DragKind }) {
       )}
       data-slot="chat-drop-overlay"
     >
-      <div className="absolute inset-2 rounded-2xl border-2 border-dashed border-[color-mix(in_srgb,var(--dt-composer-ring)_55%,transparent)] bg-[color-mix(in_srgb,var(--dt-card)_55%,transparent)] backdrop-blur-[2px] [-webkit-backdrop-filter:blur(2px)]" />
-      <div className="relative flex items-center gap-2 rounded-full border border-[color-mix(in_srgb,var(--dt-composer-ring)_45%,transparent)] bg-[color-mix(in_srgb,var(--dt-card)_92%,transparent)] px-4 py-2 text-[0.8125rem] font-medium text-foreground shadow-composer">
-        <Codicon className="text-(--ui-accent)" name={icon} size="1rem" />
+      <div className="absolute inset-2 rounded-md border border-dashed border-(--stroke-nous) bg-[color-mix(in_srgb,var(--theme-neutral-chrome)_72%,transparent)] backdrop-blur-[2px] [-webkit-backdrop-filter:blur(2px)]" />
+      <div className="relative flex items-center gap-2 rounded-md border border-(--stroke-nous) bg-[color-mix(in_srgb,var(--theme-neutral-card)_94%,transparent)] px-3 py-2 text-[0.8125rem] font-medium text-foreground shadow-composer">
+        <Codicon className="text-(--ui-text-secondary)" name={icon} size="1rem" />
         {label}
       </div>
     </div>

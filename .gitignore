@@ -147,3 +147,16 @@ apps/desktop/demo/
 # PR body is the archive. See the hermes-agent-dev skill's
 # pr-infographic-workflow reference (storage rule + lapse #8 / #COMMIT-1).
 infographic/
+
+# Local hermes runtime state
+.hermes-local/
+
+# Desktop temp directories
+.tmp-desktop-*/
+apps/desktop/tmp-user-data/
+
+# Log files
+*.log
+
+# Learning skills temp directories
+skills/learning/hermeslearn-*/

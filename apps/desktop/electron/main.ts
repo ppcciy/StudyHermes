@@ -65,7 +65,6 @@ import {
 } from './desktop-uninstall'
 import { installEmbedReferer } from './embed-referer'
 import { readDirForIpc } from './fs-read-dir'
-import { resolvePickerDefaultPath } from './wsl-path-bridge'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { scanGitRepos } from './git-repo-scan'
 import {
@@ -131,6 +130,45 @@ import { buildPathExtCandidates, chooseUpdaterArgs, getVenvSitePackagesEntries, 
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
+import { resolvePickerDefaultPath } from './wsl-path-bridge'
+
+function isBrokenPipeError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') {
+    return false
+  }
+
+  const code = 'code' in error ? error.code : undefined
+  const message = 'message' in error ? String(error.message || '') : ''
+
+  return code === 'EPIPE' || message.includes('EPIPE') || message.includes('broken pipe')
+}
+
+function installBrokenPipeGuard() {
+  const ignoreBrokenPipe = (error: unknown) => {
+    if (!isBrokenPipeError(error)) {
+      return
+    }
+  }
+
+  process.stdout.on('error', ignoreBrokenPipe)
+  process.stderr.on('error', ignoreBrokenPipe)
+
+  for (const method of ['debug', 'error', 'info', 'log', 'warn'] as const) {
+    const original = console[method].bind(console)
+
+    console[method] = (...args: unknown[]) => {
+      try {
+        original(...args)
+      } catch (error) {
+        if (!isBrokenPipeError(error)) {
+          throw error
+        }
+      }
+    }
+  }
+}
+
+installBrokenPipeGuard()
 
 const USER_DATA_OVERRIDE = process.env.HERMES_DESKTOP_USER_DATA_DIR
 
@@ -201,7 +239,25 @@ app.commandLine.appendSwitch('disable-renderer-backgrounding')
 app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
 app.commandLine.appendSwitch('disable-background-timer-throttling')
 
-const SOURCE_REPO_ROOT = path.resolve(APP_ROOT, '../..')
+function resolveSourceRepoRoot(appRoot) {
+  const candidates = []
+  let current = path.resolve(appRoot)
+
+  for (let i = 0; i < 6; i += 1) {
+    candidates.push(current)
+    const parent = path.dirname(current)
+
+    if (parent === current) {
+      break
+    }
+
+    current = parent
+  }
+
+  return candidates.find(candidate => isHermesSourceRoot(candidate)) || path.resolve(appRoot, '../..')
+}
+
+const SOURCE_REPO_ROOT = resolveSourceRepoRoot(APP_ROOT)
 
 // Build-time install stamp -- the git ref this .exe was built against.
 //
@@ -1951,7 +2007,7 @@ const schedulePersistWindowState = debounce(persistWindowState, 250)
 function resolveUpdateRoot() {
   const candidates = [
     process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT),
-    !IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT) ? SOURCE_REPO_ROOT : null,
+    isHermesSourceRoot(SOURCE_REPO_ROOT) ? SOURCE_REPO_ROOT : null,
     isHermesSourceRoot(ACTIVE_HERMES_ROOT) ? ACTIVE_HERMES_ROOT : null
   ].filter(Boolean)
 
@@ -3294,7 +3350,7 @@ function resolveHermesBackend(backendArgs) {
   //    cloned repo at SOURCE_REPO_ROOT takes precedence over ACTIVE and any
   //    installed `hermes` on PATH so local Python edits are actually exercised.
   //    (In dev with no checkout, SOURCE_REPO_ROOT won't pass isHermesSourceRoot.)
-  if (!IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT)) {
+  if (isHermesSourceRoot(SOURCE_REPO_ROOT)) {
     const backend = createPythonBackend(SOURCE_REPO_ROOT, `Hermes source at ${SOURCE_REPO_ROOT}`, backendArgs)
 
     if (backend) {

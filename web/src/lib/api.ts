@@ -604,6 +604,44 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  // HermesLearn
+  getLearningProfile: () => fetchJSON<LearningProfile>("/api/learning/profile"),
+  saveLearningProfile: (profile: LearningProfile) =>
+    fetchJSON<LearningProfile>("/api/learning/profile", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(profile),
+    }),
+  getLearningGoals: () => fetchJSON<LearningGoal[]>("/api/learning/goals"),
+  getLearningPlans: () => fetchJSON<LearningPlan[]>("/api/learning/plans"),
+  getLearningTasks: () => fetchJSON<LearningTask[]>("/api/learning/tasks"),
+  getLearningStats: () => fetchJSON<LearningStats>("/api/learning/stats"),
+  getLearningToday: () => fetchJSON<LearningTodayResponse>("/api/learning/today"),
+  analyzeLearningRequirement: (body: LearningRequirementAnalyzeRequest) =>
+    fetchJSON<LearningRequirementAnalysis>("/api/learning/requirements/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  finalizeLearningRequirement: (body: LearningRequirementFinalizeRequest) =>
+    fetchJSON<LearningRequirementFinalizeResponse>(
+      "/api/learning/requirements/finalize",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  updateLearningTaskStatus: (id: string, status: "pending" | "in_progress" | "completed" | "skipped") =>
+    fetchJSON<LearningTask>(
+      `/api/learning/tasks/${encodeURIComponent(id)}/status`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      },
+    ),
+
   // Profiles
   getProfiles: () =>
     fetchJSON<{ profiles: ProfileInfo[] }>("/api/profiles"),
@@ -1439,6 +1477,183 @@ export interface McpCatalogDiagnostic {
   name: string;
   kind: string;
   message: string;
+}
+
+export type LearningGoalStatus = "active" | "completed" | "paused" | "abandoned";
+export type LearningTaskStatus = "pending" | "in_progress" | "completed" | "skipped";
+
+export interface LearningProfile {
+  nickname: string;
+  school: string;
+  major: string;
+  grade: string;
+  semester: string;
+  career_target: string;
+  baseline_level: string;
+  weekday_minutes: number | null;
+  weekend_minutes: number | null;
+  preferred_study_time: string;
+  learning_preferences: string[];
+  current_courses: string[];
+  strengths: string;
+  weaknesses: string;
+  constraints: string;
+  updated_at?: string | null;
+  complete?: boolean;
+  missing_fields?: string[];
+  completeness?: number;
+}
+
+export interface LearningGoal {
+  id: string;
+  name: string;
+  description: string;
+  goal_type: "skill" | "knowledge" | "certification" | "project" | string;
+  status: LearningGoalStatus | string;
+  target_date: string | null;
+  created_at: string;
+  updated_at: string;
+  estimated_hours: number;
+  progress: number;
+  tags: string[];
+  prerequisites: string[];
+  requirement?: LearningRequirementDraft;
+}
+
+export interface LearningPlan {
+  id: string;
+  goal_id: string;
+  name: string;
+  description: string;
+  created_at: string;
+  updated_at: string;
+  total_tasks: number;
+  completed_tasks: number;
+}
+
+export interface LearningTask {
+  id: string;
+  plan_id: string;
+  goal_id: string;
+  title: string;
+  description: string;
+  status: LearningTaskStatus | string;
+  difficulty: string;
+  estimated_minutes: number;
+  scheduled_date: string;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+  position: number;
+  priority: number;
+}
+
+export interface LearningStats {
+  total_goals: number;
+  completed_goals: number;
+  active_goals: number;
+  total_hours_learned: number;
+  total_tasks_completed: number;
+  streak_days: number;
+  average_daily_minutes: number;
+  today_tasks: number;
+  today_completed: number;
+}
+
+export interface LearningTodayResponse {
+  date: string;
+  tasks: LearningTask[];
+  goal_names: Record<string, string>;
+}
+
+export interface LearningRequirementDraft {
+  raw_text?: string;
+  goal_name?: string;
+  purpose?: string;
+  current_level?: string;
+  target_level?: string;
+  daily_minutes?: number;
+  timeframe?: string;
+  timeframe_days?: number | null;
+  deadline?: string | null;
+  preference?: string;
+  goal_type?: "skill" | "knowledge" | "certification" | "project" | string;
+  priority?: number;
+  tags?: string[];
+  classification?: "new_goal" | "goal_extension" | "temp_task" | string;
+  existing_goal_id?: string;
+  student_context?: Record<string, unknown>;
+  time_constraints?: Record<string, unknown>;
+}
+
+export interface LearningRequirementQuestion {
+  field: keyof LearningRequirementDraft | string;
+  label: string;
+  question: string;
+  type: "text" | "number" | "select" | string;
+  placeholder?: string;
+  options?: string[];
+}
+
+export interface LearningRequirementEstimatePhase {
+  name: string;
+  hours: number;
+  days: number | null;
+}
+
+export interface LearningRequirementEstimate {
+  estimated_hours: number;
+  estimated_days: number | null;
+  available_days: number | null;
+  available_hours: number | null;
+  confidence: number;
+  fit: "comfortable" | "tight" | "at_risk" | "unknown" | string;
+  phases: LearningRequirementEstimatePhase[];
+}
+
+export interface LearningRelatedGoal {
+  id: string;
+  name: string;
+  status: string;
+  progress: number;
+  score: number;
+}
+
+export interface LearningRequirementAnalyzeRequest {
+  message?: string;
+  session_id?: string;
+  answers?: Record<string, unknown>;
+  existing_goal_id?: string;
+  profile?: Partial<LearningProfile>;
+}
+
+export interface LearningRequirementAnalysis {
+  session_id: string;
+  draft: LearningRequirementDraft;
+  missing_fields: string[];
+  questions: LearningRequirementQuestion[];
+  ready: boolean;
+  classification: string;
+  classification_label: string;
+  related_goals: LearningRelatedGoal[];
+  estimate: LearningRequirementEstimate;
+  profile?: LearningProfile;
+  profile_missing_fields?: string[];
+  profile_completeness?: number;
+}
+
+export interface LearningRequirementFinalizeRequest {
+  session_id?: string;
+  draft?: LearningRequirementDraft;
+}
+
+export interface LearningRequirementFinalizeResponse {
+  message: string;
+  goal_created: boolean;
+  goal: LearningGoal;
+  plans: LearningPlan[];
+  tasks: LearningTask[];
+  estimate: LearningRequirementEstimate;
 }
 
 

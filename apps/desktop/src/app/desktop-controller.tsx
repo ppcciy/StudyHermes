@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
-import { useQueryClient } from '@tanstack/react-query'
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { lazy, type ReactElement, Suspense, useCallback, useEffect, useMemo, useRef } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 
 import { BootFailureOverlay } from '@/components/boot-failure-overlay'
@@ -15,12 +15,15 @@ import { cn } from '@/lib/utils'
 import { useSkinCommand } from '@/themes/use-skin-command'
 
 import { formatRefValue } from '../components/assistant-ui/directive-text'
-import { getSessionMessages, type SessionMessage, triggerCronJob } from '../hermes'
-import { LearningView } from './learning'
-import { TasksView } from './tasks'
-import { StudyView } from './study'
-import { PlanningView } from './planning'
-import { MistakesView } from './mistakes'
+import {
+  finalizeLearningRequirement,
+  getLearningProfile,
+  getSessionMessages,
+  type LearningProfile,
+  type LearningRequirementAnalysis,
+  type SessionMessage,
+  triggerCronJob
+} from '../hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '../lib/chat-messages'
 import { storedSessionIdForNotification } from '../lib/session-ids'
 import { isMessagingSource } from '../lib/session-source'
@@ -42,6 +45,7 @@ import {
   unpinSession
 } from '../store/layout'
 import { respondToApprovalAction } from '../store/native-notifications'
+import { notify, notifyError } from '../store/notifications'
 import { $paneOpen } from '../store/panes'
 import { setPetActivity } from '../store/pet'
 import { setPetScale } from '../store/pet-gallery'
@@ -81,7 +85,6 @@ import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '../store
 import { isSecondaryWindow } from '../store/windows'
 
 import { ChatView } from './chat'
-import { DashboardView } from './dashboard'
 import { requestComposerFocus, requestComposerInsert } from './chat/composer/focus'
 import { useComposerActions } from './chat/hooks/use-composer-actions'
 import {
@@ -92,13 +95,17 @@ import {
 } from './chat/right-rail'
 import { ChatSidebar } from './chat/sidebar'
 import { CommandPalette } from './command-palette'
+import { DashboardView } from './dashboard'
 import { useGatewayBoot } from './gateway/hooks/use-gateway-boot'
 import { useGatewayRequest } from './gateway/hooks/use-gateway-request'
 import { useKeybinds } from './hooks/use-keybinds'
 import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from './layout-constants'
+import { LearningView } from './learning'
+import { MistakesView } from './mistakes'
 import { ModelPickerOverlay } from './model-picker-overlay'
 import { ModelVisibilityOverlay } from './model-visibility-overlay'
 import { PetGenerateOverlay } from './pet-generate/pet-generate-overlay'
+import { PlanningView } from './planning'
 import { RightSidebarPane } from './right-sidebar'
 import { FileActionDialogs } from './right-sidebar/file-actions'
 import { RemoteFolderPicker } from './right-sidebar/files/remote-picker'
@@ -107,7 +114,7 @@ import { $terminalTakeover } from './right-sidebar/store'
 import { TerminalPaneChrome } from './right-sidebar/terminal/chrome'
 import { PersistentTerminal } from './right-sidebar/terminal/persistent'
 import { closeActiveTerminal } from './right-sidebar/terminal/terminals'
-import { CRON_ROUTE, NEW_CHAT_ROUTE, routeSessionId, sessionRoute, SETTINGS_ROUTE } from './routes'
+import { CRON_ROUTE, DASHBOARD_ROUTE, NEW_CHAT_ROUTE, routeSessionId, sessionRoute, SETTINGS_ROUTE, STUDENT_PROFILE_ROUTE } from './routes'
 import { SessionPickerOverlay } from './session-picker-overlay'
 import { SessionSwitcher } from './session-switcher'
 import { useContextSuggestions } from './session/hooks/use-context-suggestions'
@@ -130,6 +137,13 @@ import { ModelMenuPanel } from './shell/model-menu-panel'
 import type { StatusbarItem } from './shell/statusbar-controls'
 import type { TitlebarTool } from './shell/titlebar-controls'
 import { useGroupRegistry } from './shell/use-group-registry'
+import {
+  LEARNING_PROFILE_QUERY_ROOT,
+  learningProfileQueryKey,
+  StudentProfileView
+} from './student-profile'
+import { StudyView } from './study'
+import { TasksView } from './tasks'
 import { UpdatesOverlay } from './updates-overlay'
 
 const AgentsView = lazy(async () => ({ default: (await import('./agents')).AgentsView }))
@@ -153,6 +167,31 @@ const CRON_POLL_INTERVAL_MS = 30_000
 // Poll the bounded messaging slice while visible so inbound platform traffic
 // appears without requiring a manual refresh or route change.
 const MESSAGING_POLL_INTERVAL_MS = 10_000
+const LEARNING_PENDING_PLAN_STORAGE_KEY = 'hermes-learning-pending-plan'
+const LEARNING_PLAN_POLL_INTERVAL_MS = 8_000
+
+function readPendingLearningPlan(): LearningRequirementAnalysis | null {
+  try {
+    const raw = window.localStorage.getItem(LEARNING_PENDING_PLAN_STORAGE_KEY)
+
+    if (!raw) {
+      return null
+    }
+
+    const parsed = JSON.parse(raw) as Partial<LearningRequirementAnalysis>
+
+    return parsed && parsed.draft && parsed.session_id ? parsed as LearningRequirementAnalysis : null
+  } catch {
+    window.localStorage.removeItem(LEARNING_PENDING_PLAN_STORAGE_KEY)
+
+    return null
+  }
+}
+
+function clearPendingLearningPlan(): void {
+  window.localStorage.removeItem(LEARNING_PENDING_PLAN_STORAGE_KEY)
+}
+
 const ACTIVE_MESSAGING_SESSION_POLL_INTERVAL_MS = 5_000
 
 function sessionMatchesStoredId(session: { id: string; _lineage_root_id?: null | string }, id: string): boolean {
@@ -189,6 +228,7 @@ export function DesktopController() {
 
   const busyRef = useRef(false)
   const creatingSessionRef = useRef(false)
+  const learningPlanPollBusyRef = useRef(false)
   const messagingTranscriptSignatureRef = useRef(new Map<string, string>())
 
   const gatewayState = useStore($gatewayState)
@@ -207,6 +247,7 @@ export function DesktopController() {
   const previewPaneOpen = useStore($paneOpen(PREVIEW_PANE_ID))
   const panesFlipped = useStore($panesFlipped)
   const profileScope = useStore($profileScope)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
   // Below SIDEBAR_COLLAPSE_BREAKPOINT_PX there's no room for a docked rail —
   // collapse both sidebars (without touching their stored open state) so the
   // hover-reveal overlay becomes the way in. Restores once it's wide again.
@@ -236,6 +277,88 @@ export function DesktopController() {
   } = useOverlayRouting()
 
   const terminalSidebarOpen = chatOpen && terminalTakeover
+
+  const studentProfileQueryKey = useMemo(
+    () => learningProfileQueryKey(activeGatewayProfile),
+    [activeGatewayProfile]
+  )
+
+  const studentProfileQuery = useQuery({
+    enabled: gatewayState === 'open' && !isSecondaryWindow(),
+    queryFn: getLearningProfile,
+    queryKey: studentProfileQueryKey,
+    retry: 1,
+    staleTime: 15_000
+  })
+
+  const studentProfileComplete = Boolean(studentProfileQuery.data?.complete)
+
+  const studentProfileGateActive =
+    !isSecondaryWindow() &&
+    gatewayState === 'open' &&
+    (studentProfileQuery.isLoading || studentProfileQuery.isError || !studentProfileComplete)
+
+  const handleStudentProfileSaved = useCallback(
+    (profile: LearningProfile) => {
+      queryClient.setQueryData(studentProfileQueryKey, profile)
+      void queryClient.invalidateQueries({ queryKey: [LEARNING_PROFILE_QUERY_ROOT] })
+    },
+    [queryClient, studentProfileQueryKey]
+  )
+
+  useEffect(() => {
+    if (gatewayState !== 'open' || isSecondaryWindow() || location.pathname.endsWith('/learning')) {
+      return undefined
+    }
+
+    const pollPendingPlan = async () => {
+      const pending = readPendingLearningPlan()
+
+      if (!pending || learningPlanPollBusyRef.current) {
+        return
+      }
+
+      learningPlanPollBusyRef.current = true
+
+      try {
+        const result = await finalizeLearningRequirement({
+          draft: pending.draft,
+          session_id: pending.session_id
+        })
+
+        if (result.plan_status === 'generating') {
+          return
+        }
+
+        clearPendingLearningPlan()
+        notify({
+          kind: 'success',
+          message: result.goal_created
+            ? `已创建 ${result.plans.length} 个阶段，${result.tasks.length} 个任务。`
+            : '学习计划已更新。',
+          title: result.goal?.name ?? pending.draft.goal_name ?? '学习计划已生成'
+        })
+        void queryClient.invalidateQueries({ queryKey: ['learning-overview'] })
+        void queryClient.invalidateQueries({ queryKey: ['learning-dashboard'] })
+        void queryClient.invalidateQueries({ queryKey: ['study-today-tasks'] })
+        void queryClient.invalidateQueries({ queryKey: ['today-tasks-page'] })
+      } catch (error) {
+        clearPendingLearningPlan()
+        notifyError(error, '学习计划生成失败')
+      } finally {
+        learningPlanPollBusyRef.current = false
+      }
+    }
+
+    void pollPendingPlan()
+    const timer = window.setInterval(() => void pollPendingPlan(), LEARNING_PLAN_POLL_INTERVAL_MS)
+
+    return () => window.clearInterval(timer)
+  }, [gatewayState, location.pathname, queryClient])
+
+  const continueToHome = useCallback(() => {
+    navigate(DASHBOARD_ROUTE)
+  }, [navigate])
 
   const titlebarToolGroups = useGroupRegistry<TitlebarTool>()
   const statusbarItemGroups = useGroupRegistry<StatusbarItem>()
@@ -663,7 +786,6 @@ export function DesktopController() {
   // without this the statusbar keeps showing the previous profile's model
   // (the "forgets the LLM setting" report). gatewayState stays 'open' across a
   // swap (background sockets persist), so the open→open effect won't re-run.
-  const activeGatewayProfile = useStore($activeGatewayProfile)
   const lastGatewayProfileRef = useRef(activeGatewayProfile)
 
   useEffect(() => {
@@ -1114,7 +1236,18 @@ export function DesktopController() {
     </>
   )
 
-  const chatView = (
+  const studentProfileGateView = (
+    <StudentProfileView
+      enabled={gatewayState === 'open'}
+      mode="gate"
+      onContinue={continueToHome}
+      onSaved={handleStudentProfileSaved}
+    />
+  )
+
+  const requireStudentProfile = (element: ReactElement) => (studentProfileGateActive ? studentProfileGateView : element)
+
+  const chatView = requireStudentProfile(
     <ChatView
       gateway={gatewayRef.current}
       maxVoiceRecordingSeconds={voiceMaxRecordingSeconds}
@@ -1293,12 +1426,13 @@ export function DesktopController() {
       )}
       <PaneMain>
         <Routes>
-          <Route element={<DashboardView />} index />
-          <Route element={<DashboardView />} path="dashboard" />
-          <Route element={<LearningView />} path="learning" />
-          <Route element={<TasksView />} path="tasks" />
-          <Route element={<StudyView />} path="study" />
-          <Route element={<PlanningView />} path="planning" />
+          <Route element={requireStudentProfile(<DashboardView />)} index />
+          <Route element={requireStudentProfile(<DashboardView />)} path="dashboard" />
+          <Route element={<StudentProfileView enabled={gatewayState === 'open'} mode="edit" onContinue={continueToHome} onSaved={handleStudentProfileSaved} />} path={STUDENT_PROFILE_ROUTE.slice(1)} />
+          <Route element={requireStudentProfile(<LearningView />)} path="learning" />
+          <Route element={requireStudentProfile(<TasksView />)} path="tasks" />
+          <Route element={requireStudentProfile(<StudyView />)} path="study" />
+          <Route element={requireStudentProfile(<PlanningView />)} path="planning" />
           <Route element={<MistakesView />} path="mistakes" />
           <Route element={chatView} path="chat" />
           <Route element={chatView} path="chat/:sessionId" />

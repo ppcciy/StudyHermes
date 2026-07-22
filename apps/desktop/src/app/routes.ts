@@ -1,5 +1,6 @@
 export const SESSION_ROUTE_PREFIX = '/chat'
 export const NEW_CHAT_ROUTE = '/chat'
+export const DASHBOARD_ROUTE = '/dashboard'
 export const SETTINGS_ROUTE = '/settings'
 export const COMMAND_CENTER_ROUTE = '/command-center'
 export const SKILLS_ROUTE = '/skills'
@@ -9,6 +10,7 @@ export const CRON_ROUTE = '/cron'
 export const PROFILES_ROUTE = '/profiles'
 export const AGENTS_ROUTE = '/agents'
 export const STARMAP_ROUTE = '/starmap'
+export const STUDENT_PROFILE_ROUTE = '/student-profile'
 
 export type AppView =
   | 'agents'
@@ -16,23 +18,37 @@ export type AppView =
   | 'chat'
   | 'command-center'
   | 'cron'
+  | 'dashboard'
+  | 'learning'
   | 'messaging'
+  | 'mistakes'
+  | 'planning'
   | 'profiles'
   | 'settings'
   | 'skills'
   | 'starmap'
+  | 'student-profile'
+  | 'study'
+  | 'tasks'
 
 export type AppRouteId =
   | 'agents'
   | 'artifacts'
   | 'command-center'
   | 'cron'
+  | 'dashboard'
+  | 'learning'
   | 'messaging'
+  | 'mistakes'
   | 'new'
+  | 'planning'
   | 'profiles'
   | 'settings'
   | 'skills'
   | 'starmap'
+  | 'student-profile'
+  | 'study'
+  | 'tasks'
 
 export interface AppRoute {
   id: AppRouteId
@@ -41,6 +57,8 @@ export interface AppRoute {
 }
 
 export const APP_ROUTES = [
+  { id: 'dashboard', path: '/', view: 'dashboard' },
+  { id: 'dashboard', path: DASHBOARD_ROUTE, view: 'dashboard' },
   { id: 'new', path: NEW_CHAT_ROUTE, view: 'chat' },
   { id: 'settings', path: SETTINGS_ROUTE, view: 'settings' },
   { id: 'command-center', path: COMMAND_CENTER_ROUTE, view: 'command-center' },
@@ -50,7 +68,13 @@ export const APP_ROUTES = [
   { id: 'cron', path: CRON_ROUTE, view: 'cron' },
   { id: 'profiles', path: PROFILES_ROUTE, view: 'profiles' },
   { id: 'agents', path: AGENTS_ROUTE, view: 'agents' },
-  { id: 'starmap', path: STARMAP_ROUTE, view: 'starmap' }
+  { id: 'starmap', path: STARMAP_ROUTE, view: 'starmap' },
+  { id: 'student-profile', path: STUDENT_PROFILE_ROUTE, view: 'student-profile' },
+  { id: 'learning', path: '/learning', view: 'learning' },
+  { id: 'tasks', path: '/tasks', view: 'tasks' },
+  { id: 'study', path: '/study', view: 'study' },
+  { id: 'planning', path: '/planning', view: 'planning' },
+  { id: 'mistakes', path: '/mistakes', view: 'mistakes' }
 ] as const satisfies readonly AppRoute[]
 
 const APP_VIEW_BY_PATH = new Map<string, AppView>(APP_ROUTES.map(route => [route.path, route.view]))

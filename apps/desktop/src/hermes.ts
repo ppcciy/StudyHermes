@@ -1211,6 +1211,8 @@ export function runDebugShare(): Promise<DebugShareResponse> {
 // Learning API
 // ---------------------------------------------------------------------------
 
+const LEARNING_AGENT_REQUEST_TIMEOUT_MS = 180_000
+
 export interface LearningGoal {
   id: string
   name: string
@@ -1224,6 +1226,7 @@ export interface LearningGoal {
   progress: number
   tags: string[]
   prerequisites: string[]
+  requirement?: LearningRequirementDraft
 }
 
 export interface LearningPlan {
@@ -1252,6 +1255,13 @@ export interface DailyTask {
   updated_at: string
   position: number
   priority: number
+  recommended_start_time?: string
+  recommended_end_time?: string
+  schedule_reason?: string
+  learning_feedback?: LearningTaskCompletionFeedback
+  ahead?: boolean
+  ahead_reason?: string
+  recommended_for_date?: string
 }
 
 export interface LearningStats {
@@ -1269,21 +1279,218 @@ export interface LearningStats {
 export interface TodayTasksResponse {
   date: string
   tasks: DailyTask[]
+  ahead_date?: string
+  ahead_tasks?: DailyTask[]
   goal_names: Record<string, string>
+  generated_by?: string
+  skill?: null | string
+  timetable_error?: null | string
+  timetable_status?: 'model_generating' | 'model_unavailable' | 'none' | 'ready' | string
+}
+
+export interface LearningTaskGuidance {
+  task_id: string
+  error?: string
+  generated_by: 'learning-skill' | 'learning-skill-cache' | 'learning-skill-failed' | 'learning-skill-pending' | 'llm'
+  skill?: string
+  status?: 'failed' | 'generating' | 'ready' | string
+  updated_at: string
+  summary: string
+  steps: string[]
+  focus_points: string[]
+  pitfalls: string[]
+  checklist: string[]
+}
+
+export interface LearningTaskCompletionFeedback {
+  actual_minutes?: number
+  feedback?: string
+  mastery_level?: string
+  blockers?: string[]
+  next_focus?: string
+  submitted_at?: string
+  analysis_status?: string
+  analysis_error?: string
+  analysis?: Record<string, unknown>
+}
+
+export interface UpdateTaskStatusRequest {
+  actual_minutes?: number
+  blockers?: string[]
+  feedback?: string
+  mastery_level?: string
+  next_focus?: string
+  status: string
 }
 
 export interface GeneratePlanResponse {
   message: string
+  plan_status?: 'generating' | 'ready' | string
+  duplicate_goal?: boolean
+  duplicate_of?: string | null
+  goal_created?: boolean
   goal_id: string
   goal_name: string
+  retry_after_seconds?: number
+  session_id?: string
+  status?: 'generating' | 'ready' | string
   total_plans: number
   total_tasks: number
+}
+
+export interface LearningProfile {
+  nickname: string
+  school: string
+  major: string
+  grade: string
+  semester: string
+  career_target: string
+  baseline_level: string
+  weekday_minutes: number | null
+  weekend_minutes: number | null
+  preferred_study_time: string
+  learning_preferences: string[]
+  current_courses: string[]
+  strengths: string
+  weaknesses: string
+  constraints: string
+  updated_at?: null | string
+  complete?: boolean
+  missing_fields?: string[]
+  completeness?: number
+}
+
+export interface LearningRequirementDraft {
+  raw_text?: string
+  goal_name?: string
+  purpose?: string
+  current_level?: string
+  target_level?: string
+  daily_minutes?: number
+  timeframe?: string
+  timeframe_days?: null | number
+  deadline?: null | string
+  preference?: string
+  goal_type?: string
+  priority?: number
+  tags?: string[]
+  classification?: string
+  existing_goal_id?: string
+  student_context?: Record<string, unknown>
+  time_constraints?: Record<string, unknown>
+}
+
+export interface LearningRequirementQuestion {
+  field: keyof LearningRequirementDraft | string
+  label: string
+  question: string
+  type: string
+  placeholder?: string
+  options?: string[]
+}
+
+export interface LearningRequirementEstimatePhase {
+  name: string
+  hours: number
+  days: null | number
+}
+
+export interface LearningRequirementEstimate {
+  estimated_hours: number
+  estimated_days: null | number
+  available_days: null | number
+  available_hours: null | number
+  confidence: number
+  fit: string
+  phases: LearningRequirementEstimatePhase[]
+}
+
+export interface LearningRelatedGoal {
+  id: string
+  name: string
+  status: string
+  progress: number
+  score: number
+}
+
+export interface LearningRequirementAnalyzeRequest {
+  answers?: Record<string, unknown>
+  existing_goal_id?: string
+  message?: string
+  session_id?: string
+}
+
+export interface LearningRequirementAnalysis {
+  session_id: string
+  draft: LearningRequirementDraft
+  missing_fields: string[]
+  questions: LearningRequirementQuestion[]
+  ready: boolean
+  classification: string
+  classification_label: string
+  related_goals: LearningRelatedGoal[]
+  estimate: LearningRequirementEstimate
+  profile?: LearningProfile
+  profile_missing_fields?: string[]
+  profile_completeness?: number
+}
+
+export interface LearningRequirementFinalizeRequest {
+  draft?: LearningRequirementDraft
+  force_retry?: boolean
+  session_id?: string
+}
+
+export interface LearningRequirementFinalizeResponse {
+  message: string
+  plan_status?: 'generating' | 'ready' | string
+  retry_after_seconds?: number
+  session_id?: string
+  status?: 'generating' | 'ready' | string
+  duplicate_goal?: boolean
+  duplicate_of?: string | null
+  goal_created: boolean
+  goal: LearningGoal | null
+  plans: LearningPlan[]
+  tasks: DailyTask[]
+  estimate: LearningRequirementEstimate
+}
+
+export function getLearningProfile(): Promise<LearningProfile> {
+  return window.hermesDesktop.api<LearningProfile>({
+    ...profileScoped(),
+    path: '/api/learning/profile'
+  })
+}
+
+export function saveLearningProfile(profile: LearningProfile): Promise<LearningProfile> {
+  return window.hermesDesktop.api<LearningProfile>({
+    ...profileScoped(),
+    path: '/api/learning/profile',
+    method: 'PUT',
+    body: profile
+  })
 }
 
 export function getLearningGoals(): Promise<LearningGoal[]> {
   return window.hermesDesktop.api<LearningGoal[]>({
     ...profileScoped(),
     path: '/api/learning/goals'
+  })
+}
+
+export function deleteLearningGoal(goalId: string): Promise<{ message: string }> {
+  return window.hermesDesktop.api<{ message: string }>({
+    ...profileScoped(),
+    path: `/api/learning/goals/${encodeURIComponent(goalId)}`,
+    method: 'DELETE'
+  })
+}
+
+export function getLearningPlans(): Promise<LearningPlan[]> {
+  return window.hermesDesktop.api<LearningPlan[]>({
+    ...profileScoped(),
+    path: '/api/learning/plans'
   })
 }
 
@@ -1297,7 +1504,18 @@ export function getLearningStats(): Promise<LearningStats> {
 export function getTodayTasks(): Promise<TodayTasksResponse> {
   return window.hermesDesktop.api<TodayTasksResponse>({
     ...profileScoped(),
-    path: '/api/learning/today'
+    path: '/api/learning/today',
+    timeoutMs: LEARNING_AGENT_REQUEST_TIMEOUT_MS
+  })
+}
+
+export function getLearningTaskGuidance(taskId: string, options?: { refresh?: boolean }): Promise<LearningTaskGuidance> {
+  const suffix = options?.refresh ? '?refresh=1' : ''
+
+  return window.hermesDesktop.api<LearningTaskGuidance>({
+    ...profileScoped(),
+    path: `/api/learning/tasks/${encodeURIComponent(taskId)}/guidance${suffix}`,
+    timeoutMs: LEARNING_AGENT_REQUEST_TIMEOUT_MS
   })
 }
 
@@ -1306,16 +1524,44 @@ export function generateLearningPlan(topic: string): Promise<GeneratePlanRespons
     ...profileScoped(),
     path: '/api/learning/generate',
     method: 'POST',
-    body: { topic }
+    body: { topic },
+    timeoutMs: LEARNING_AGENT_REQUEST_TIMEOUT_MS
   })
 }
 
-export function updateTaskStatus(taskId: string, status: string): Promise<DailyTask> {
+export function updateTaskStatus(taskId: string, body: string | UpdateTaskStatusRequest): Promise<DailyTask> {
+  const requestBody = typeof body === 'string' ? { status: body } : body
+
   return window.hermesDesktop.api<DailyTask>({
     ...profileScoped(),
     path: `/api/learning/tasks/${encodeURIComponent(taskId)}/status`,
     method: 'POST',
-    body: { status }
+    body: requestBody,
+    timeoutMs: LEARNING_AGENT_REQUEST_TIMEOUT_MS
+  })
+}
+
+export function analyzeLearningRequirement(
+  body: LearningRequirementAnalyzeRequest
+): Promise<LearningRequirementAnalysis> {
+  return window.hermesDesktop.api<LearningRequirementAnalysis>({
+    ...profileScoped(),
+    path: '/api/learning/requirements/analyze',
+    method: 'POST',
+    body,
+    timeoutMs: LEARNING_AGENT_REQUEST_TIMEOUT_MS
+  })
+}
+
+export function finalizeLearningRequirement(
+  body: LearningRequirementFinalizeRequest
+): Promise<LearningRequirementFinalizeResponse> {
+  return window.hermesDesktop.api<LearningRequirementFinalizeResponse>({
+    ...profileScoped(),
+    path: '/api/learning/requirements/finalize',
+    method: 'POST',
+    body,
+    timeoutMs: LEARNING_AGENT_REQUEST_TIMEOUT_MS
   })
 }
 
@@ -1373,11 +1619,16 @@ export function getWrongQuestions(params?: {
   mastery_status?: string
 }): Promise<WrongQuestion[]> {
   const query = new URLSearchParams()
-  if (params?.subject) query.set('subject', params.subject)
-  if (params?.knowledge_point) query.set('knowledge_point', params.knowledge_point)
-  if (params?.error_type) query.set('error_type', params.error_type)
-  if (params?.difficulty) query.set('difficulty', params.difficulty)
-  if (params?.mastery_status) query.set('mastery_status', params.mastery_status)
+
+  if (params?.subject) {query.set('subject', params.subject)}
+
+  if (params?.knowledge_point) {query.set('knowledge_point', params.knowledge_point)}
+
+  if (params?.error_type) {query.set('error_type', params.error_type)}
+
+  if (params?.difficulty) {query.set('difficulty', params.difficulty)}
+
+  if (params?.mastery_status) {query.set('mastery_status', params.mastery_status)}
 
   return window.hermesDesktop.api<WrongQuestion[]>({
     ...profileScoped(),

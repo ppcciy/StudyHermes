@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import inspect
 import json
-from datetime import datetime, timedelta, timezone
+import logging
+import os
+import re
+import threading
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -27,7 +35,61 @@ from agent.learning_models import (
 router = APIRouter(prefix="/api/learning", tags=["learning"])
 
 _LEARNING_DATA_DIR = get_hermes_home() / "learning"
-_LEARNING_DATA_DIR.mkdir(exist_ok=True)
+_LEARNING_DATA_DIR.mkdir(parents=True, exist_ok=True)
+_LEARNING_CREATE_LOCK = threading.RLock()
+_LEARNING_REQUIREMENT_LLM_TIMEOUT_SECONDS: Optional[float] = None
+_LEARNING_PLAN_RETRY_AFTER_SECONDS = 8
+_LEARNING_LLM_BACKGROUND_TIMEOUT_SECONDS = 30 * 60.0
+_LEARNING_PROGRESS_FEEDBACK_LLM_TIMEOUT_SECONDS: Optional[float] = None
+_LEARNING_TASK_GUIDANCE_CACHE_TTL_SECONDS = 6 * 60 * 60
+_LEARNING_REQUIREMENT_MAX_OUTPUT_TOKENS = 700
+_LEARNING_PLAN_MAX_OUTPUT_TOKENS = 1500
+_LEARNING_TIMETABLE_MAX_OUTPUT_TOKENS = 1000
+_LEARNING_TASK_GUIDANCE_MAX_OUTPUT_TOKENS = 600
+_LEARNING_PROGRESS_FEEDBACK_MAX_OUTPUT_TOKENS = 700
+_LEARNING_COURSE_PLAN_CACHE_TTL_SECONDS = 24 * 60 * 60
+_LEARNING_LLM_MAX_ITERATIONS = 3
+_TODAY_SCHEDULE_VERSION = 2
+_LEARNING_SKILLS_DIR = Path(__file__).resolve().parents[1] / "skills" / "learning"
+_LEARNING_SKILL_DIRS = {
+    "requirement-intake": "hermeslearn-requirement-intake",
+    "course-planner": "hermeslearn-course-planner",
+    "daily-scheduler": "hermeslearn-daily-scheduler",
+    "task-guidance": "hermeslearn-task-guidance",
+    "progress-feedback": "hermeslearn-progress-feedback",
+}
+_LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
+_log = logging.getLogger(__name__)
+_TASK_GUIDANCE_INFLIGHT: Dict[str, asyncio.Task] = {}
+_COURSE_PLAN_INFLIGHT: Dict[str, asyncio.Task] = {}
+_TODAY_TIMETABLE_INFLIGHT: Dict[str, asyncio.Task] = {}
+
+
+class LearningSkillError(RuntimeError):
+    """Raised when a required HermesLearn skill cannot produce usable JSON."""
+
+    def __init__(self, skill_name: str, message: str, *, status_code: int = 502):
+        super().__init__(message)
+        self.skill_name = skill_name
+        self.status_code = status_code
+
+
+class LearningSkillTimeoutError(LearningSkillError):
+    def __init__(self, skill_name: str, timeout_seconds: float):
+        super().__init__(
+            skill_name,
+            f"{skill_name} timed out after {timeout_seconds:.1f}s",
+            status_code=504,
+        )
+
+
+class LearningSkillPendingError(LearningSkillError):
+    def __init__(self, skill_name: str):
+        super().__init__(
+            skill_name,
+            f"{skill_name} is still generating",
+            status_code=202,
+        )
 
 
 class CreateLearningGoalRequest(BaseModel):
@@ -52,12 +114,49 @@ class CreateDailyTaskRequest(BaseModel):
     description: str = ""
     difficulty: str = "medium"
     estimated_minutes: int = 30
-    scheduled_date: str
+    scheduled_date: str = ""
     priority: int = 3
 
 
 class UpdateTaskStatusRequest(BaseModel):
     status: str = "completed"
+    actual_minutes: Optional[int] = None
+    feedback: str = ""
+    mastery_level: str = ""
+    blockers: List[str] = Field(default_factory=list)
+    next_focus: str = ""
+
+
+class LearningProfileRequest(BaseModel):
+    nickname: str = ""
+    school: str = ""
+    major: str = ""
+    grade: str = ""
+    semester: str = ""
+    career_target: str = ""
+    baseline_level: str = ""
+    weekday_minutes: Optional[int] = None
+    weekend_minutes: Optional[int] = None
+    preferred_study_time: str = ""
+    learning_preferences: List[str] = Field(default_factory=list)
+    current_courses: List[str] = Field(default_factory=list)
+    strengths: str = ""
+    weaknesses: str = ""
+    constraints: str = ""
+
+
+class AnalyzeLearningRequirementRequest(BaseModel):
+    message: str = ""
+    session_id: Optional[str] = None
+    answers: Dict[str, Any] = Field(default_factory=dict)
+    existing_goal_id: Optional[str] = None
+    profile: Dict[str, Any] = Field(default_factory=dict)
+
+
+class FinalizeLearningRequirementRequest(BaseModel):
+    session_id: Optional[str] = None
+    draft: Dict[str, Any] = Field(default_factory=dict)
+    force_retry: bool = False
 
 
 def _generate_id() -> str:
@@ -66,11 +165,21 @@ def _generate_id() -> str:
     return secrets.token_urlsafe(16)
 
 
+def _read_learning_json_dict(path: Path) -> Dict[str, Any]:
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError as exc:
+            _log.warning("Could not parse learning data file %s: %s", path, exc)
+            return {}
+        if isinstance(loaded, dict):
+            return loaded
+    return {}
+
+
 def _load_goals() -> Dict[str, Dict[str, Any]]:
     path = _LEARNING_DATA_DIR / "goals.json"
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return {}
+    return _read_learning_json_dict(path)
 
 
 def _save_goals(goals: Dict[str, Dict[str, Any]]) -> None:
@@ -80,9 +189,7 @@ def _save_goals(goals: Dict[str, Dict[str, Any]]) -> None:
 
 def _load_plans() -> Dict[str, Dict[str, Any]]:
     path = _LEARNING_DATA_DIR / "plans.json"
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return {}
+    return _read_learning_json_dict(path)
 
 
 def _save_plans(plans: Dict[str, Dict[str, Any]]) -> None:
@@ -92,14 +199,110 @@ def _save_plans(plans: Dict[str, Dict[str, Any]]) -> None:
 
 def _load_tasks() -> Dict[str, Dict[str, Any]]:
     path = _LEARNING_DATA_DIR / "tasks.json"
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return {}
+    return _read_learning_json_dict(path)
 
 
 def _save_tasks(tasks: Dict[str, Dict[str, Any]]) -> None:
     path = _LEARNING_DATA_DIR / "tasks.json"
     path.write_text(json.dumps(tasks, indent=2), encoding="utf-8")
+
+
+def _default_learning_profile() -> Dict[str, Any]:
+    return {
+        "nickname": "",
+        "school": "",
+        "major": "",
+        "grade": "",
+        "semester": "",
+        "career_target": "",
+        "baseline_level": "",
+        "weekday_minutes": None,
+        "weekend_minutes": None,
+        "preferred_study_time": "",
+        "learning_preferences": [],
+        "current_courses": [],
+        "strengths": "",
+        "weaknesses": "",
+        "constraints": "",
+        "updated_at": None,
+    }
+
+
+def _normalize_text_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [
+            item.strip()
+            for item in re.split(r"[,，、\n]", value)
+            if item.strip()
+        ]
+    return []
+
+
+def _normalize_minutes(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        minutes = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return max(0, minutes)
+
+
+def _load_learning_profile() -> Dict[str, Any]:
+    path = _LEARNING_DATA_DIR / "profile.json"
+    profile = _default_learning_profile()
+    if path.exists():
+        loaded = _read_learning_json_dict(path)
+        if isinstance(loaded, dict):
+            profile.update(loaded)
+    profile["learning_preferences"] = _normalize_text_list(
+        profile.get("learning_preferences")
+    )
+    profile["current_courses"] = _normalize_text_list(profile.get("current_courses"))
+    profile["weekday_minutes"] = _normalize_minutes(profile.get("weekday_minutes"))
+    profile["weekend_minutes"] = _normalize_minutes(profile.get("weekend_minutes"))
+    return profile
+
+
+def _save_learning_profile(profile: Dict[str, Any]) -> None:
+    path = _LEARNING_DATA_DIR / "profile.json"
+    path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+
+
+def _load_requirement_sessions() -> Dict[str, Dict[str, Any]]:
+    path = _LEARNING_DATA_DIR / "requirements.json"
+    return _read_learning_json_dict(path)
+
+
+def _save_requirement_sessions(sessions: Dict[str, Dict[str, Any]]) -> None:
+    path = _LEARNING_DATA_DIR / "requirements.json"
+    path.write_text(json.dumps(sessions, indent=2), encoding="utf-8")
+
+
+def _load_schedule_state() -> Dict[str, Any]:
+    path = _LEARNING_DATA_DIR / "schedule_state.json"
+    return _read_learning_json_dict(path)
+
+
+def _save_schedule_state(state: Dict[str, Any]) -> None:
+    path = _LEARNING_DATA_DIR / "schedule_state.json"
+    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def _local_now() -> datetime:
+    return datetime.now(_LOCAL_TIMEZONE)
+
+
+def _local_today() -> date:
+    return _local_now().date()
+
+
+def _local_date_from(value: datetime) -> date:
+    if value.tzinfo:
+        return value.astimezone(_LOCAL_TIMEZONE).date()
+    return value.replace(tzinfo=_LOCAL_TIMEZONE).date()
 
 
 def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -111,6 +314,44 @@ def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+@router.get("/profile", response_model=Dict[str, Any])
+async def get_learning_profile(request: Request):
+    return _profile_with_status(_load_learning_profile())
+
+
+@router.put("/profile", response_model=Dict[str, Any])
+async def update_learning_profile(request: Request, body: LearningProfileRequest):
+    now = datetime.now(timezone.utc)
+    profile = _default_learning_profile()
+    profile.update(
+        {
+            "nickname": body.nickname.strip(),
+            "school": body.school.strip(),
+            "major": body.major.strip(),
+            "grade": body.grade.strip(),
+            "semester": body.semester.strip(),
+            "career_target": body.career_target.strip(),
+            "baseline_level": body.baseline_level.strip(),
+            "weekday_minutes": _normalize_minutes(body.weekday_minutes),
+            "weekend_minutes": _normalize_minutes(body.weekend_minutes),
+            "preferred_study_time": body.preferred_study_time.strip(),
+            "learning_preferences": _normalize_text_list(body.learning_preferences),
+            "current_courses": _normalize_text_list(body.current_courses),
+            "strengths": body.strengths.strip(),
+            "weaknesses": body.weaknesses.strip(),
+            "constraints": body.constraints.strip(),
+            "updated_at": now.isoformat(),
+        }
+    )
+    _save_learning_profile(profile)
+    schedule_now = _local_now()
+    goals = _load_goals()
+    tasks = _load_tasks()
+    if _refresh_today_task_schedule(tasks, goals, profile, schedule_now, force=True):
+        _save_tasks(tasks)
+    return _profile_with_status(profile)
+
+
 @router.get("/goals", response_model=List[Dict[str, Any]])
 async def get_learning_goals(request: Request):
     goals = _load_goals()
@@ -119,35 +360,54 @@ async def get_learning_goals(request: Request):
 
 @router.post("/goals", response_model=Dict[str, Any])
 async def create_learning_goal(request: Request, body: CreateLearningGoalRequest):
-    goals = _load_goals()
-
     try:
         goal_type = LearningGoalType(body.goal_type)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid goal type")
 
-    now = datetime.now(timezone.utc)
-    goal_id = _generate_id()
+    with _LEARNING_CREATE_LOCK:
+        goals = _load_goals()
+        duplicate_goal = _find_similar_active_goal(
+            {
+                "description": body.description,
+                "goal_name": body.name,
+                "goal_type": goal_type.value,
+                "name": body.name,
+                "tags": body.tags,
+            },
+            goals,
+        )
+        if duplicate_goal:
+            return {
+                **duplicate_goal,
+                "duplicate_goal": True,
+                "duplicate_of": duplicate_goal.get("id"),
+                "goal_created": False,
+                "message": "已存在相似学习目标，未重复创建。",
+            }
 
-    goal: Dict[str, Any] = {
-        "id": goal_id,
-        "name": body.name,
-        "description": body.description,
-        "goal_type": body.goal_type,
-        "status": "active",
-        "target_date": body.target_date,
-        "created_at": now.isoformat(),
-        "updated_at": now.isoformat(),
-        "estimated_hours": body.estimated_hours,
-        "progress": 0.0,
-        "tags": body.tags,
-        "prerequisites": [],
-    }
+        now = datetime.now(timezone.utc)
+        goal_id = _generate_id()
 
-    goals[goal_id] = goal
-    _save_goals(goals)
+        goal: Dict[str, Any] = {
+            "id": goal_id,
+            "name": body.name,
+            "description": body.description,
+            "goal_type": goal_type.value,
+            "status": "active",
+            "target_date": body.target_date,
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "estimated_hours": body.estimated_hours,
+            "progress": 0.0,
+            "tags": body.tags,
+            "prerequisites": [],
+        }
 
-    return goal
+        goals[goal_id] = goal
+        _save_goals(goals)
+
+        return {**goal, "goal_created": True}
 
 
 @router.get("/goals/{goal_id}", response_model=Dict[str, Any])
@@ -226,13 +486,28 @@ async def update_goal_status(request: Request, goal_id: str, status: str):
 @router.get("/plans", response_model=List[Dict[str, Any]])
 async def get_learning_plans(request: Request):
     plans = _load_plans()
-    return list(plans.values())
+    return [
+        plan
+        for _, plan in sorted(
+            enumerate(plans.values()),
+            key=lambda item: (
+                str(item[1].get("goal_id") or ""),
+                _plan_sort_key(item[1], item[0]),
+            ),
+        )
+    ]
 
 
 @router.get("/goals/{goal_id}/plans", response_model=List[Dict[str, Any]])
 async def get_goal_plans(request: Request, goal_id: str):
     plans = _load_plans()
-    return [p for p in plans.values() if p["goal_id"] == goal_id]
+    return [
+        plan
+        for _, plan in sorted(
+            enumerate(p for p in plans.values() if p.get("goal_id") == goal_id),
+            key=lambda item: _plan_sort_key(item[1], item[0]),
+        )
+    ]
 
 
 @router.post("/plans", response_model=Dict[str, Any])
@@ -254,6 +529,7 @@ async def create_learning_plan(request: Request, body: CreateLearningPlanRequest
         "updated_at": now.isoformat(),
         "total_tasks": 0,
         "completed_tasks": 0,
+        "position": _next_plan_position(plans, body.goal_id),
     }
 
     plans[plan_id] = plan
@@ -337,6 +613,14 @@ async def create_daily_task(request: Request, body: CreateDailyTaskRequest):
     }
 
     tasks[task_id] = task
+    _refresh_today_task_schedule(
+        tasks,
+        _load_goals(),
+        _load_learning_profile(),
+        _local_now(),
+        force=True,
+        plans=plans,
+    )
     _save_tasks(tasks)
 
     plans[body.plan_id]["total_tasks"] += 1
@@ -354,6 +638,32 @@ async def get_daily_task(request: Request, task_id: str):
     return tasks[task_id]
 
 
+@router.get("/tasks/{task_id}/guidance", response_model=Dict[str, Any])
+async def get_task_guidance(request: Request, task_id: str):
+    tasks = _load_tasks()
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = tasks[task_id]
+    goals = _load_goals()
+    plans = _load_plans()
+    profile = _load_learning_profile()
+
+    refresh = (
+        request is not None
+        and str(request.query_params.get("refresh") or "").strip().lower()
+        in {"1", "true", "yes"}
+    )
+    return await _build_task_guidance_response(
+        task=task,
+        goal=goals.get(str(task.get("goal_id") or "")),
+        plan=plans.get(str(task.get("plan_id") or "")),
+        profile=profile,
+        recent_feedback=_recent_feedback_for_goal(str(task.get("goal_id") or ""), tasks),
+        force_retry=refresh,
+    )
+
+
 @router.post("/tasks/{task_id}/status", response_model=Dict[str, Any])
 async def update_task_status(request: Request, task_id: str, body: UpdateTaskStatusRequest):
     tasks = _load_tasks()
@@ -363,9 +673,10 @@ async def update_task_status(request: Request, task_id: str, body: UpdateTaskSta
     try:
         TaskStatus(body.status)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid status")
+            raise HTTPException(status_code=400, detail="Invalid status")
 
     now = datetime.now(timezone.utc)
+    was_completed = tasks[task_id].get("status") == TaskStatus.COMPLETED.value
     tasks[task_id]["status"] = body.status
     tasks[task_id]["updated_at"] = now.isoformat()
 
@@ -375,9 +686,15 @@ async def update_task_status(request: Request, task_id: str, body: UpdateTaskSta
         plans = _load_plans()
         plan_id = tasks[task_id]["plan_id"]
         if plan_id in plans:
-            plans[plan_id]["completed_tasks"] += 1
+            plan_tasks = [
+                task
+                for task in tasks.values()
+                if task.get("plan_id") == plan_id
+            ]
+            plans[plan_id]["completed_tasks"] = sum(
+                1 for task in plan_tasks if task.get("status") == TaskStatus.COMPLETED.value
+            )
             plans[plan_id]["updated_at"] = now.isoformat()
-            _save_plans(plans)
 
         goals = _load_goals()
         goal_id = tasks[task_id]["goal_id"]
@@ -388,7 +705,77 @@ async def update_task_status(request: Request, task_id: str, body: UpdateTaskSta
             if total > 0:
                 goals[goal_id]["progress"] = round((completed / total) * 100, 1)
             goals[goal_id]["updated_at"] = now.isoformat()
-            _save_goals(goals)
+
+        feedback_text = _text_or_empty(body.feedback, 1200)
+        actual_minutes = _coerce_positive_int(
+            body.actual_minutes,
+            _coerce_positive_int(
+                tasks[task_id].get("estimated_minutes"),
+                30,
+                minimum=1,
+                maximum=8 * 60,
+            ),
+            minimum=1,
+            maximum=8 * 60,
+        )
+        if body.actual_minutes is not None:
+            raw_feedback = _task_learning_feedback(tasks[task_id])
+            tasks[task_id]["learning_feedback"] = {
+                **raw_feedback,
+                "actual_minutes": actual_minutes,
+            }
+
+        has_feedback = any(
+            [
+                feedback_text,
+                _text_or_empty(body.mastery_level, 80),
+                body.blockers,
+                _text_or_empty(body.next_focus, 500),
+            ]
+        )
+        if has_feedback:
+            profile = _load_learning_profile()
+            feedback_payload = {
+                "actual_minutes": actual_minutes,
+                "feedback": feedback_text,
+                "mastery_level": _text_or_empty(body.mastery_level, 80),
+                "blockers": _normalize_text_list(body.blockers),
+                "next_focus": _text_or_empty(body.next_focus, 500),
+            }
+            await _analyze_and_apply_task_feedback(
+                tasks=tasks,
+                plans=plans,
+                goals=goals,
+                task_id=task_id,
+                profile=profile,
+                feedback=feedback_payload,
+                now=now,
+            )
+
+        if plan_id in plans:
+            plan_tasks = [
+                task
+                for task in tasks.values()
+                if task.get("plan_id") == plan_id
+            ]
+            plans[plan_id]["completed_tasks"] = sum(
+                1 for task in plan_tasks if task.get("status") == TaskStatus.COMPLETED.value
+            )
+            plans[plan_id]["total_tasks"] = len(plan_tasks)
+            plans[plan_id]["updated_at"] = now.isoformat()
+
+        if goal_id in goals:
+            goal_tasks = [t for t in tasks.values() if t["goal_id"] == goal_id]
+            completed = sum(1 for t in goal_tasks if t["status"] == "completed")
+            total = len(goal_tasks)
+            if total > 0:
+                goals[goal_id]["progress"] = round((completed / total) * 100, 1)
+            goals[goal_id]["updated_at"] = now.isoformat()
+
+        _save_plans(plans)
+        _save_goals(goals)
+    elif was_completed:
+        tasks[task_id]["completed_at"] = None
 
     _save_tasks(tasks)
     return tasks[task_id]
@@ -418,7 +805,12 @@ async def delete_daily_task(request: Request, task_id: str):
 @router.get("/stats", response_model=Dict[str, Any])
 async def get_learning_stats(request: Request):
     goals = _load_goals()
+    plans = _load_plans()
     tasks = _load_tasks()
+    profile = _load_learning_profile()
+    now = _local_now()
+    if _refresh_today_task_schedule(tasks, goals, profile, now, plans=plans):
+        _save_tasks(tasks)
 
     total_goals = len(goals)
     completed_goals = sum(1 for g in goals.values() if g["status"] == "completed")
@@ -426,13 +818,15 @@ async def get_learning_stats(request: Request):
 
     completed_tasks = sum(1 for t in tasks.values() if t["status"] == "completed")
     total_minutes = sum(
-        t["estimated_minutes"] for t in tasks.values() if t["status"] == "completed"
+        _completed_task_actual_minutes(t)
+        for t in tasks.values()
+        if t["status"] == "completed"
     )
     total_hours = round(total_minutes / 60, 1)
 
-    today = datetime.now(timezone.utc).date()
+    today = _local_date_from(now)
     today_tasks = [
-        t for t in tasks.values() if _parse_datetime(t["scheduled_date"]).date() == today
+        t for t in tasks.values() if _task_scheduled_date(t) == today
     ]
 
     stats: Dict[str, Any] = {
@@ -450,26 +844,4471 @@ async def get_learning_stats(request: Request):
     return stats
 
 
+def _completed_task_actual_minutes(task: Dict[str, Any]) -> int:
+    feedback = task.get("learning_feedback")
+    if not isinstance(feedback, dict):
+        return 0
+
+    try:
+        minutes = int(round(float(feedback.get("actual_minutes") or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+    return max(0, minutes)
+
+
 @router.get("/today", response_model=Dict[str, Any])
 async def get_today_tasks(request: Request):
+    goals = _load_goals()
+    plans = _load_plans()
     tasks = _load_tasks()
-    today = datetime.now(timezone.utc).date()
+    profile = _load_learning_profile()
+    now = _local_now()
+    if _refresh_today_task_schedule(tasks, goals, profile, now, plans=plans):
+        _save_tasks(tasks)
+    today = _local_date_from(now)
+    plan_order_by_id = _plan_order_by_id(plans)
 
     today_tasks = [
         t
         for t in tasks.values()
-        if _parse_datetime(t["scheduled_date"]).date() == today
+        if _task_scheduled_date(t) == today
     ]
 
-    today_tasks.sort(key=lambda t: t.get("priority", 3))
+    today_tasks.sort(key=lambda t: _daily_task_sort_key(t, today, plan_order_by_id))
+    timetable_entries = _local_today_timetable_entries(today_tasks, profile)
 
-    goals = _load_goals()
+    timetable_by_task = {
+        str(entry.get("task_id")): entry
+        for entry in timetable_entries
+        if isinstance(entry, dict)
+    }
+    today_tasks = [dict(task) for task in today_tasks]
+    for task in today_tasks:
+        entry = timetable_by_task.get(str(task.get("id") or ""))
+        if entry:
+            task["recommended_start_time"] = entry.get("start_time")
+            task["recommended_end_time"] = entry.get("end_time")
+            task["schedule_reason"] = entry.get("reason")
+
+    today_tasks.sort(key=lambda task: _daily_task_sort_key(task, today, plan_order_by_id))
+    all_today_completed = bool(today_tasks) and all(
+        task.get("status") == TaskStatus.COMPLETED.value for task in today_tasks
+    )
+    ahead_tasks = (
+        _ahead_task_recommendations(tasks, goals, today, plans=plans)
+        if all_today_completed
+        else []
+    )
 
     return {
         "date": today.isoformat(),
         "tasks": today_tasks,
+        "ahead_date": (today + timedelta(days=1)).isoformat(),
+        "ahead_tasks": ahead_tasks,
         "goal_names": {g["id"]: g["name"] for g in goals.values()},
+        "generated_by": "local-timetable" if today_tasks else "none",
+        "skill": None,
+        "timetable_status": "ready" if today_tasks else "none",
+        "timetable_error": None,
     }
+
+
+_CHINESE_NUMBERS = {
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+    "十": 10,
+    "半": 0.5,
+}
+
+_TOPIC_HINTS = [
+    ("machine learning", "机器学习"),
+    ("javascript", "JavaScript"),
+    ("typescript", "TypeScript"),
+    ("python", "Python"),
+    ("react", "React"),
+    ("vue", "Vue"),
+    ("java", "Java"),
+    ("数据分析", "数据分析"),
+    ("机器学习", "机器学习"),
+    ("人工智能", "人工智能"),
+    ("深度学习", "深度学习"),
+    ("数据结构与算法", "数据结构与算法"),
+    ("数据结构", "数据结构"),
+    ("考研数学", "考研数学"),
+    ("考研英语", "考研英语"),
+    ("英语四六级", "英语四六级"),
+    ("英语", "英语"),
+    ("数学", "数学"),
+]
+
+_TOPIC_HINTS.extend(
+    [
+        ("\u9ad8\u6570", "\u9ad8\u7b49\u6570\u5b66"),
+        ("\u9ad8\u7b49\u6570\u5b66", "\u9ad8\u7b49\u6570\u5b66"),
+        ("\u7ebf\u4ee3", "\u7ebf\u6027\u4ee3\u6570"),
+        ("\u7ebf\u6027\u4ee3\u6570", "\u7ebf\u6027\u4ee3\u6570"),
+        ("\u6982\u7387\u8bba", "\u6982\u7387\u8bba\u4e0e\u6570\u7406\u7edf\u8ba1"),
+        ("\u6570\u7406\u7edf\u8ba1", "\u6982\u7387\u8bba\u4e0e\u6570\u7406\u7edf\u8ba1"),
+        ("\u5927\u7269", "\u5927\u5b66\u7269\u7406"),
+        ("\u5927\u5b66\u7269\u7406", "\u5927\u5b66\u7269\u7406"),
+    ]
+)
+
+_SYSTEM_LEARNING_PURPOSE = "\u7cfb\u7edf\u5b66\u4e60"
+_EXAM_CERT_PURPOSE = "\u8003\u8bd5/\u8003\u8bc1"
+_COURSE_TOPIC_KEYWORDS = [
+    "\u9ad8\u6570",
+    "\u9ad8\u7b49\u6570\u5b66",
+    "\u7ebf\u4ee3",
+    "\u7ebf\u6027\u4ee3\u6570",
+    "\u6982\u7387\u8bba",
+    "\u6570\u7406\u7edf\u8ba1",
+    "\u6570\u636e\u7ed3\u6784",
+    "\u6570\u636e\u7ed3\u6784\u4e0e\u7b97\u6cd5",
+    "\u5927\u7269",
+    "\u5927\u5b66\u7269\u7406",
+    "\u671f\u672b",
+    "\u8bfe\u7a0b",
+]
+_GOAL_CREATE_COMMAND_PREFIXES = [
+    "\u6dfb\u52a0",
+    "\u65b0\u589e",
+    "\u65b0\u5efa",
+    "\u521b\u5efa",
+    "\u52a0\u5165",
+    "\u5b89\u6392",
+    "\u5236\u5b9a",
+    "\u751f\u6210",
+]
+_GOAL_CREATE_LEADING_WORDS = [
+    "\u8bf7",
+    "\u9ebb\u70e6",
+    "\u5e2e\u6211",
+    "\u7ed9\u6211",
+    "\u4e3a\u6211",
+    "\u6211\u8981",
+    "\u6211\u60f3",
+]
+_GOAL_CREATE_FILLER_WORDS = [
+    "\u4e00\u4e2a",
+    "\u4e00\u95e8",
+    "\u4e00\u4efd",
+    "\u4e00\u4e0b",
+    "\u65b0\u7684",
+    "\u5173\u4e8e",
+    "\u6709\u5173",
+]
+_GOAL_TOPIC_TRAILING_WORDS = [
+    "\u5b66\u4e60\u76ee\u6807",
+    "\u5b66\u4e60\u8ba1\u5212",
+    "\u5b66\u4e60",
+    "\u76ee\u6807",
+    "\u8ba1\u5212",
+    "\u8bfe\u7a0b",
+]
+_GOAL_TOPIC_INLINE_STOPS = [
+    "\u4e3a\u4e86",
+    "\u7528\u6765",
+    "\u6bcf\u5929",
+    "\u6bcf\u65e5",
+    "\u4e00\u5929",
+    "\u5e0c\u671b",
+    "\u60f3\u8981",
+    "\u6253\u7b97",
+]
+
+_FIELD_QUESTIONS = {
+    "goal_name": {
+        "label": "学习目标",
+        "question": "你具体想学习哪个方向或主题？",
+        "type": "text",
+        "placeholder": "例如 Java 后端开发",
+    },
+    "purpose": {
+        "label": "学习用途",
+        "question": "这次学习主要为了什么结果？",
+        "type": "select",
+        "options": ["找工作", "转行", "考试/考证", "完成项目", "提升工作能力", "兴趣探索"],
+    },
+    "current_level": {
+        "label": "当前基础",
+        "question": "你现在大概是什么基础？",
+        "type": "select",
+        "options": ["零基础", "入门", "初级", "中级", "高级"],
+    },
+    "target_level": {
+        "label": "目标水平",
+        "question": "你希望学到什么程度？",
+        "type": "select",
+        "options": ["能独立完成项目", "达到面试/就业水平", "通过考试", "系统掌握", "快速了解"],
+    },
+    "daily_minutes": {
+        "label": "每日时间",
+        "question": "每天能稳定投入多少分钟？",
+        "type": "number",
+        "placeholder": "例如 90",
+    },
+    "timeframe": {
+        "label": "周期/截止",
+        "question": "你希望多久完成，或具体截止到哪天？",
+        "type": "select",
+        "options": ["1个月", "3个月", "半年", "1年"],
+    },
+    "preference": {
+        "label": "学习偏好",
+        "question": "你更偏好哪种学习方式？",
+        "type": "select",
+        "options": ["项目实战", "视频课程", "文档阅读", "刷题训练", "AI 陪练"],
+    },
+}
+
+_REQUIRED_REQUIREMENT_FIELDS = [
+    "goal_name",
+    "purpose",
+    "current_level",
+    "target_level",
+    "preference",
+]
+
+
+def _blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _number_from_text(value: str) -> Optional[float]:
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    if raw in _CHINESE_NUMBERS:
+        return float(_CHINESE_NUMBERS[raw])
+    if "十" in raw:
+        left, _, right = raw.partition("十")
+        tens = _CHINESE_NUMBERS.get(left, 1) if left else 1
+        ones = _CHINESE_NUMBERS.get(right, 0) if right else 0
+        if isinstance(tens, (int, float)) and isinstance(ones, (int, float)):
+            return float(tens * 10 + ones)
+    return None
+
+
+def _minutes_from_value(amount: float, unit: str, divider: float = 1.0) -> int:
+    normalized = unit.lower()
+    if normalized.startswith("分") or normalized.startswith("min"):
+        minutes = amount
+    else:
+        minutes = amount * 60
+    return max(1, int(round(minutes / divider)))
+
+
+def _extract_daily_minutes(text: str) -> Optional[int]:
+    number = r"(?P<num>\d+(?:\.\d+)?|[一二两三四五六七八九十半]+)"
+    units = r"(?P<unit>小时|h|hrs?|hours?|分钟|min(?:ute)?s?)"
+    daily_patterns = [
+        rf"(?:每天|每日|一天|daily|per day)[^\d一二两三四五六七八九十半]{{0,8}}{number}\s*{units}",
+        rf"{number}\s*{units}[^。；,，\n]{{0,8}}(?:每天|每日|一天|daily|per day)",
+    ]
+    weekly_patterns = [
+        rf"(?:每周|一周|weekly|per week)[^\d一二两三四五六七八九十半]{{0,8}}{number}\s*{units}",
+        rf"{number}\s*{units}[^。；,，\n]{{0,8}}(?:每周|一周|weekly|per week)",
+    ]
+
+    for pattern in daily_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            amount = _number_from_text(match.group("num"))
+            if amount:
+                return _minutes_from_value(amount, match.group("unit"))
+
+    for pattern in weekly_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            amount = _number_from_text(match.group("num"))
+            if amount:
+                return _minutes_from_value(amount, match.group("unit"), divider=7)
+
+    return None
+
+
+def _coerce_daily_minutes(value: Any) -> Optional[int]:
+    if isinstance(value, (int, float)) and value > 0:
+        return int(round(value))
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if re.fullmatch(r"\d+(?:\.\d+)?", stripped):
+            return max(1, int(round(float(stripped))))
+        return _extract_daily_minutes(stripped)
+    return None
+
+
+def _extract_timeframe(text: str) -> Optional[Dict[str, Any]]:
+    match = re.search(
+        r"(?P<num>\d+(?:\.\d+)?|[一二两三四五六七八九十半]+)\s*(?P<unit>个月|月|周|星期|天|年|days?|weeks?|months?|years?)",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    amount = _number_from_text(match.group("num"))
+    if not amount:
+        return None
+    unit = match.group("unit").lower()
+    if unit in {"年", "year", "years"}:
+        days = amount * 365
+    elif unit in {"个月", "月", "month", "months"}:
+        days = amount * 30
+    elif unit in {"周", "星期", "week", "weeks"}:
+        days = amount * 7
+    else:
+        days = amount
+    return {"label": match.group(0).strip(), "days": max(1, int(round(days)))}
+
+
+def _coerce_timeframe(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, dict):
+        label = str(value.get("label") or value.get("timeframe") or "").strip()
+        days = value.get("days") or value.get("timeframe_days")
+        try:
+            day_count = int(days) if days is not None else None
+        except (TypeError, ValueError):
+            day_count = None
+        if label or day_count:
+            return {"label": label or f"{day_count}天", "days": day_count}
+    if isinstance(value, (int, float)) and value > 0:
+        return {"label": f"{int(value)}天", "days": int(value)}
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if re.fullmatch(r"\d+(?:\.\d+)?", stripped):
+            days = int(round(float(stripped)))
+            return {"label": f"{days}天", "days": days}
+        extracted = _extract_timeframe(stripped)
+        if extracted:
+            return extracted
+        return {"label": stripped, "days": None}
+    return None
+
+
+def _extract_deadline(text: str) -> Optional[str]:
+    patterns = [
+        r"(?P<year>20\d{2})[/-](?P<month>\d{1,2})[/-](?P<day>\d{1,2})",
+        r"(?P<year>20\d{2})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        try:
+            dt = datetime(
+                int(match.group("year")),
+                int(match.group("month")),
+                int(match.group("day")),
+                tzinfo=timezone.utc,
+            )
+            return dt.date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _coerce_deadline(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        extracted = _extract_deadline(stripped)
+        if extracted:
+            return extracted
+        parsed = _parse_datetime(stripped)
+        if parsed:
+            return parsed.date().isoformat()
+    return None
+
+
+def _days_until(deadline: Optional[str]) -> Optional[int]:
+    parsed = _parse_datetime(deadline)
+    if not parsed:
+        return None
+    today = _local_today()
+    delta = (parsed.date() - today).days
+    return max(1, delta) if delta >= 0 else None
+
+
+def _clean_goal_name_candidate(value: str) -> Optional[str]:
+    candidate = re.split(r"[\uff0c,\u3002\uff1b;!！?？\n\r]", value, maxsplit=1)[0]
+    candidate = candidate.strip(" \t:：,，。.!！?？")
+    for stop in _GOAL_TOPIC_INLINE_STOPS:
+        if stop in candidate:
+            candidate = candidate.split(stop, 1)[0].strip()
+    changed = True
+    while changed:
+        changed = False
+        for word in _GOAL_TOPIC_TRAILING_WORDS:
+            if candidate.endswith(word) and len(candidate) > len(word):
+                candidate = candidate[: -len(word)].strip()
+                changed = True
+    candidate = re.sub(r"\s+", " ", candidate).strip(" \t:：,，。.!！?？")
+    if not candidate:
+        return None
+    has_topic_token = bool(re.search(r"[A-Za-z0-9+#.\u4e00-\u9fff]", candidate))
+    if not has_topic_token or len(candidate) > 40:
+        return None
+    return candidate
+
+
+def _extract_create_command_topic(text: str) -> Optional[str]:
+    candidate = text.strip()
+    if not candidate:
+        return None
+    changed = True
+    while changed:
+        changed = False
+        for word in _GOAL_CREATE_LEADING_WORDS:
+            if candidate.startswith(word):
+                candidate = candidate[len(word) :].strip()
+                changed = True
+    for prefix in _GOAL_CREATE_COMMAND_PREFIXES:
+        if not candidate.startswith(prefix):
+            continue
+        candidate = candidate[len(prefix) :].strip()
+        changed = True
+        while changed:
+            changed = False
+            for word in _GOAL_CREATE_FILLER_WORDS:
+                if candidate.startswith(word):
+                    candidate = candidate[len(word) :].strip()
+                    changed = True
+        return _clean_goal_name_candidate(candidate)
+    return None
+
+
+def _extract_goal_name(text: str) -> Optional[str]:
+    lower = text.lower()
+    for needle, label in _TOPIC_HINTS:
+        if needle.lower() in lower:
+            return label
+
+    command_topic = _extract_create_command_topic(text)
+    if command_topic:
+        return command_topic
+
+    match = re.search(
+        r"(?:想学|学习|学会|掌握|入门|精通|准备|备考|攻克|刷)\s*([A-Za-z0-9+#. \u4e00-\u9fff]{2,32})",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    value = match.group(1).strip(" ，,。.!！")
+    for stop in [
+        "找工作",
+        "就业",
+        "面试",
+        "转行",
+        "考试",
+        "考证",
+        "每天",
+        "每日",
+        "一天",
+        "小时",
+        "分钟",
+    ]:
+        if stop in value:
+            value = value.split(stop)[0]
+    value = re.sub(r"\s+", " ", value).strip(" ，,。.!！")
+    return value or None
+
+
+def _infer_purpose(text: str) -> Optional[str]:
+    if any(word in text for word in _COURSE_TOPIC_KEYWORDS):
+        return _EXAM_CERT_PURPOSE
+    if any(word in text for word in ["找工作", "就业", "面试", "求职"]):
+        return "找工作"
+    if any(word in text for word in ["转行", "换工作"]):
+        return "转行"
+    if any(word in text for word in ["考试", "考证", "备考", "证书"]):
+        return "考试/考证"
+    if any(word in text for word in ["项目", "作品", "毕业设计"]):
+        return "完成项目"
+    if any(word in text for word in ["工作", "业务", "升职"]):
+        return "提升工作能力"
+    if any(word in text for word in ["兴趣", "爱好", "了解"]):
+        return "兴趣探索"
+    return None
+
+
+def _infer_current_level(text: str) -> Optional[str]:
+    if any(word in text for word in ["零基础", "小白", "没基础", "没有基础", "从零"]):
+        return "零基础"
+    if any(word in text for word in ["入门", "会一点", "刚开始"]):
+        return "入门"
+    if any(word in text for word in ["初级", "基础语法"]):
+        return "初级"
+    if any(word in text for word in ["中级", "做过项目", "有项目经验"]):
+        return "中级"
+    if any(word in text for word in ["高级", "熟练", "资深"]):
+        return "高级"
+    return None
+
+
+def _infer_target_level(text: str) -> Optional[str]:
+    if any(word in text for word in ["找工作", "就业", "面试", "求职"]):
+        return "达到面试/就业水平"
+    if any(word in text for word in ["独立项目", "做项目", "作品", "上线"]):
+        return "能独立完成项目"
+    if any(word in text for word in ["考试", "考证", "通过"]):
+        return "通过考试"
+    if any(word in text for word in ["系统掌握", "精通", "熟练掌握"]):
+        return "系统掌握"
+    if any(word in text for word in ["快速了解", "入门", "了解"]):
+        return "快速了解"
+    return None
+
+
+def _infer_preference(text: str) -> Optional[str]:
+    if any(word in text for word in ["项目", "实战", "作品", "动手"]):
+        return "项目实战"
+    if any(word in text for word in ["视频", "网课", "课程"]):
+        return "视频课程"
+    if any(word in text for word in ["文档", "书", "阅读"]):
+        return "文档阅读"
+    if any(word in text for word in ["刷题", "题目", "练题"]):
+        return "刷题训练"
+    if any(word in text for word in ["陪练", "互动", "问答", "AI"]):
+        return "AI 陪练"
+    return None
+
+
+def _infer_goal_type(text: str, purpose: Optional[str]) -> str:
+    if purpose == "考试/考证" or any(word in text for word in ["考试", "证书", "考证"]):
+        return "certification"
+    if purpose == "完成项目" or any(word in text for word in ["项目", "作品", "上线"]):
+        return "project"
+    if any(word in text.lower() for word in ["python", "java", "react", "vue", "javascript"]):
+        return "skill"
+    return "knowledge"
+
+
+def _default_target_level(
+    goal_type: str, purpose: Optional[str], goal_name: Optional[str]
+) -> str:
+    haystack = " ".join([goal_type or "", purpose or "", goal_name or ""])
+    if purpose == _EXAM_CERT_PURPOSE or any(word in haystack for word in _COURSE_TOPIC_KEYWORDS):
+        return "\u7cfb\u7edf\u638c\u63e1\u6838\u5fc3\u6982\u5ff5\u5e76\u80fd\u5b8c\u6210\u8bfe\u7a0b\u9898\u76ee"
+    if goal_type == LearningGoalType.PROJECT.value:
+        return "\u80fd\u72ec\u7acb\u5b8c\u6210\u53ef\u5c55\u793a\u9879\u76ee"
+    if goal_type == LearningGoalType.SKILL.value:
+        return "\u7cfb\u7edf\u638c\u63e1\u5e76\u80fd\u5b8c\u6210\u5b9e\u8df5\u4efb\u52a1"
+    return "\u7cfb\u7edf\u638c\u63e1\u6838\u5fc3\u6982\u5ff5"
+
+
+def _normalize_goal_type(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip().lower()
+    aliases = {
+        "技能": "skill",
+        "skill": "skill",
+        "知识": "knowledge",
+        "knowledge": "knowledge",
+        "考试": "certification",
+        "考证": "certification",
+        "certification": "certification",
+        "项目": "project",
+        "project": "project",
+    }
+    return aliases.get(raw)
+
+
+def _profile_average_daily_minutes(profile: Dict[str, Any]) -> Optional[int]:
+    weekday = _normalize_minutes(profile.get("weekday_minutes"))
+    weekend = _normalize_minutes(profile.get("weekend_minutes"))
+    if weekday is None and weekend is None:
+        return None
+    weekday = weekday or 0
+    weekend = weekend or 0
+    return int(round((weekday * 5 + weekend * 2) / 7))
+
+
+def _student_context_from_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "nickname": profile.get("nickname") or "",
+        "school": profile.get("school") or "",
+        "major": profile.get("major") or "",
+        "grade": profile.get("grade") or "",
+        "semester": profile.get("semester") or "",
+        "career_target": profile.get("career_target") or "",
+        "baseline_level": profile.get("baseline_level") or "",
+        "current_courses": _normalize_text_list(profile.get("current_courses")),
+        "strengths": profile.get("strengths") or "",
+        "weaknesses": profile.get("weaknesses") or "",
+        "constraints": profile.get("constraints") or "",
+    }
+
+
+def _time_constraints_from_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+    weekday = _normalize_minutes(profile.get("weekday_minutes"))
+    weekend = _normalize_minutes(profile.get("weekend_minutes"))
+    return {
+        "weekday_minutes": weekday,
+        "weekend_minutes": weekend,
+        "weekly_minutes": (weekday or 0) * 5 + (weekend or 0) * 2
+        if weekday is not None or weekend is not None
+        else None,
+        "preferred_study_time": profile.get("preferred_study_time") or "",
+        "constraints": profile.get("constraints") or "",
+    }
+
+
+def _purpose_from_career_target(career_target: str) -> Optional[str]:
+    if any(word in career_target for word in ["就业", "找工作", "实习", "面试"]):
+        return "找工作"
+    if any(word in career_target for word in ["考研", "保研", "考公", "考证", "考试"]):
+        return "考试/考证"
+    if any(word in career_target for word in ["竞赛", "项目", "作品"]):
+        return "完成项目"
+    if any(word in career_target for word in ["转专业", "转行"]):
+        return "转行"
+    return None
+
+
+def _is_computing_major(major: str) -> bool:
+    return any(
+        word in major
+        for word in ["计算机", "软件", "人工智能", "数据", "网络", "信息", "自动化"]
+    )
+
+
+def _missing_profile_fields(profile: Dict[str, Any]) -> List[str]:
+    missing = []
+    for field in ["major", "grade", "career_target", "baseline_level"]:
+        if _blank(profile.get(field)):
+            missing.append(field)
+    weekday_minutes = _normalize_minutes(profile.get("weekday_minutes"))
+    weekend_minutes = _normalize_minutes(profile.get("weekend_minutes"))
+    if weekday_minutes is None or weekday_minutes <= 0:
+        missing.append("weekday_minutes")
+    if weekend_minutes is None or weekend_minutes <= 0:
+        missing.append("weekend_minutes")
+    if not _normalize_text_list(profile.get("learning_preferences")):
+        missing.append("learning_preferences")
+    return missing
+
+
+def _profile_status(profile: Dict[str, Any]) -> Dict[str, Any]:
+    missing = _missing_profile_fields(profile)
+    return {
+        "complete": len(missing) == 0,
+        "missing_fields": missing,
+        "completeness": round(1 - (len(missing) / 7), 2),
+    }
+
+
+def _profile_with_status(profile: Dict[str, Any]) -> Dict[str, Any]:
+    return {**profile, **_profile_status(profile)}
+
+
+def _require_complete_learning_profile() -> Dict[str, Any]:
+    profile = _load_learning_profile()
+    status = _profile_status(profile)
+    if not status["complete"]:
+        raise HTTPException(
+            status_code=428,
+            detail={
+                "message": "Learning profile is required before using the agent",
+                **status,
+            },
+        )
+    return profile
+
+
+def _derive_tags(draft: Dict[str, Any], text: str) -> List[str]:
+    tags = []
+    for key in ["goal_name", "purpose", "current_level", "target_level", "preference"]:
+        value = draft.get(key)
+        if isinstance(value, str) and value and value not in tags:
+            tags.append(value)
+    for needle, label in _TOPIC_HINTS:
+        if needle.lower() in text.lower() and label not in tags:
+            tags.append(label)
+    return tags[:8]
+
+
+_INACTIVE_GOAL_STATUSES = {
+    LearningGoalStatus.COMPLETED.value,
+    LearningGoalStatus.ABANDONED.value,
+}
+_GOAL_DUPLICATE_THRESHOLD = 0.62
+_GOAL_BROAD_ASCII_TOKENS = {
+    "ai",
+    "c",
+    "c#",
+    "c++",
+    "css",
+    "go",
+    "html",
+    "java",
+    "javascript",
+    "js",
+    "ml",
+    "python",
+    "react",
+    "sql",
+    "ts",
+    "vue",
+}
+_GOAL_TOKEN_ALIASES = {
+    "js": "javascript",
+    "py": "python",
+    "ts": "typescript",
+}
+_GOAL_NAME_STOPWORDS = {
+    "学习",
+    "学会",
+    "掌握",
+    "了解",
+    "入门",
+    "基础",
+    "进阶",
+    "提升",
+    "准备",
+    "目标",
+    "计划",
+    "课程",
+    "编程",
+    "开发",
+    "训练",
+    "复习",
+}
+
+
+def _goal_candidate_name(candidate: Dict[str, Any]) -> str:
+    return str(candidate.get("goal_name") or candidate.get("name") or "").strip()
+
+
+def _goal_candidate_text(candidate: Dict[str, Any]) -> str:
+    requirement = candidate.get("requirement") if isinstance(candidate.get("requirement"), dict) else {}
+    parts: List[str] = [
+        _goal_candidate_name(candidate),
+        str(candidate.get("goal_type") or ""),
+        str(candidate.get("purpose") or requirement.get("purpose") or ""),
+        str(candidate.get("target_level") or requirement.get("target_level") or ""),
+        str(candidate.get("preference") or requirement.get("preference") or ""),
+    ]
+    for tag in candidate.get("tags", []) or []:
+        parts.append(str(tag))
+    return " ".join(part for part in parts if part)
+
+
+def _canonical_goal_name(value: str) -> str:
+    normalized = re.sub(r"[\s,，、。.!！？:：;；/\\|·_-]+", "", value.lower())
+    for stopword in _GOAL_NAME_STOPWORDS:
+        normalized = normalized.replace(stopword, "")
+    return normalized
+
+
+def _ascii_goal_tokens(value: str) -> set[str]:
+    return {
+        _GOAL_TOKEN_ALIASES.get(token, token)
+        for token in re.findall(r"[a-z0-9+#.]+", value.lower())
+        if token
+    }
+
+
+def _goal_tokens(value: str) -> set[str]:
+    tokens = _ascii_goal_tokens(value)
+    normalized = value.lower()
+
+    for sequence in re.findall(r"[\u4e00-\u9fff]+", normalized):
+        if len(sequence) >= 2 and sequence not in _GOAL_NAME_STOPWORDS:
+            tokens.add(sequence)
+        for width in (2, 3):
+            if len(sequence) < width:
+                continue
+            for index in range(0, len(sequence) - width + 1):
+                token = sequence[index : index + width]
+                if token not in _GOAL_NAME_STOPWORDS:
+                    tokens.add(token)
+
+    return tokens
+
+
+def _containment_score(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / min(len(left), len(right))
+
+
+def _goal_similarity_score(candidate: Dict[str, Any], goal: Dict[str, Any]) -> float:
+    candidate_name = _goal_candidate_name(candidate)
+    goal_name = _goal_candidate_name(goal)
+    candidate_canonical = _canonical_goal_name(candidate_name)
+    goal_canonical = _canonical_goal_name(goal_name)
+    candidate_ascii = _ascii_goal_tokens(candidate_name)
+    goal_ascii = _ascii_goal_tokens(goal_name)
+
+    if candidate_canonical and candidate_canonical == goal_canonical:
+        return 1.0
+
+    has_ascii_conflict = bool(candidate_ascii and goal_ascii and not candidate_ascii.intersection(goal_ascii))
+    if (
+        not has_ascii_conflict
+        and min(len(candidate_canonical), len(goal_canonical)) >= 4
+        and (candidate_canonical in goal_canonical or goal_canonical in candidate_canonical)
+    ):
+        return 0.92
+
+    candidate_name_tokens = _goal_tokens(candidate_name)
+    goal_name_tokens = _goal_tokens(goal_name)
+    candidate_tokens = _goal_tokens(_goal_candidate_text(candidate))
+    goal_tokens = _goal_tokens(_goal_candidate_text(goal))
+    name_score = _containment_score(candidate_name_tokens, goal_name_tokens)
+    full_score = _containment_score(candidate_tokens, goal_tokens) * 0.86
+    shared_name_tokens = candidate_name_tokens.intersection(goal_name_tokens)
+
+    # Metadata such as "考试/考证", "系统掌握" or "刷题训练" often matches
+    # across unrelated university courses. Only let full-text similarity help
+    # duplicate detection after the course/topic names already share signal.
+    if not shared_name_tokens:
+        full_score = min(full_score, 0.45)
+
+    score = max(name_score, full_score)
+
+    if (
+        len(shared_name_tokens) == 1
+        and next(iter(shared_name_tokens)) in _GOAL_BROAD_ASCII_TOKENS
+        and not any(re.search(r"[\u4e00-\u9fff]", token) for token in shared_name_tokens)
+    ):
+        score = min(score, 0.55)
+
+    candidate_goal_type = str(candidate.get("goal_type") or "").strip()
+    goal_type = str(goal.get("goal_type") or "").strip()
+    if score > 0 and candidate_goal_type and candidate_goal_type == goal_type:
+        score += 0.06
+
+    return min(1.0, score)
+
+
+def _find_similar_active_goal(
+    candidate: Dict[str, Any], goals: Dict[str, Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    best_goal: Optional[Dict[str, Any]] = None
+    best_score = 0.0
+
+    for goal in goals.values():
+        if str(goal.get("status") or "") in _INACTIVE_GOAL_STATUSES:
+            continue
+
+        score = _goal_similarity_score(candidate, goal)
+        if score > best_score:
+            best_goal = goal
+            best_score = score
+
+    if best_goal and best_score >= _GOAL_DUPLICATE_THRESHOLD:
+        return best_goal
+    return None
+
+
+def _goal_records(
+    goal_id: str, plans: Dict[str, Dict[str, Any]], tasks: Dict[str, Dict[str, Any]]
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    goal_plans = [plan for plan in plans.values() if plan.get("goal_id") == goal_id]
+    goal_plan_ids = {str(plan.get("id")) for plan in goal_plans}
+    plan_order_by_id = _plan_order_by_id(plans)
+    goal_tasks = [
+        task
+        for task in tasks.values()
+        if task.get("goal_id") == goal_id or str(task.get("plan_id")) in goal_plan_ids
+    ]
+    goal_plans.sort(key=lambda plan: _plan_sort_key(plan, plan_order_by_id.get(str(plan.get("id") or ""), 0)))
+    goal_tasks.sort(
+        key=lambda task: (
+            plan_order_by_id.get(str(task.get("plan_id") or ""), 0),
+            int(task.get("position") or 0),
+            str(task.get("scheduled_date") or ""),
+            str(task.get("created_at") or ""),
+            str(task.get("id") or ""),
+        )
+    )
+    return goal_plans, goal_tasks
+
+
+def _related_goals(
+    draft: Dict[str, Any], goals: Dict[str, Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    if not _goal_candidate_name(draft):
+        return []
+    related: List[Dict[str, Any]] = []
+    for goal in goals.values():
+        if str(goal.get("status") or "") in _INACTIVE_GOAL_STATUSES:
+            continue
+        score = _goal_similarity_score(draft, goal)
+        if score >= _GOAL_DUPLICATE_THRESHOLD:
+            related.append(
+                {
+                    "id": goal.get("id"),
+                    "name": goal.get("name"),
+                    "status": goal.get("status"),
+                    "progress": goal.get("progress", 0),
+                    "score": round(score, 3),
+                }
+            )
+    related.sort(key=lambda item: item["score"], reverse=True)
+    return related[:5]
+
+
+def _is_temp_requirement(text: str) -> bool:
+    markers = ["临时", "今天复习", "讲一下", "解释一下", "帮我看看", "出几道题", "练一下"]
+    return any(marker in text for marker in markers)
+
+
+def _classify_requirement(
+    text: str,
+    draft: Dict[str, Any],
+    goals: Dict[str, Dict[str, Any]],
+    existing_goal_id: Optional[str],
+) -> str:
+    if existing_goal_id and existing_goal_id in goals:
+        return "goal_extension"
+    if _is_temp_requirement(text):
+        return "temp_task"
+    return "new_goal"
+
+
+_REQUIREMENT_DRAFT_FIELDS = {
+    "goal_name",
+    "purpose",
+    "current_level",
+    "target_level",
+    "daily_minutes",
+    "timeframe",
+    "timeframe_days",
+    "deadline",
+    "preference",
+    "goal_type",
+    "priority",
+    "tags",
+    "existing_goal_id",
+}
+
+_VALID_REQUIREMENT_CLASSIFICATIONS = {"new_goal", "goal_extension", "temp_task"}
+
+
+def _apply_requirement_field(draft: Dict[str, Any], field: str, value: Any) -> None:
+    if _blank(value) and field not in {"deadline", "timeframe_days"}:
+        return
+
+    if field == "daily_minutes":
+        minutes = _coerce_daily_minutes(value)
+        if minutes:
+            draft[field] = max(10, min(360, minutes))
+        return
+
+    if field == "timeframe":
+        parsed_timeframe = _coerce_timeframe(value)
+        if parsed_timeframe:
+            draft["timeframe"] = parsed_timeframe["label"]
+            if parsed_timeframe.get("days"):
+                draft["timeframe_days"] = parsed_timeframe["days"]
+        return
+
+    if field == "timeframe_days":
+        try:
+            days = int(value)
+        except (TypeError, ValueError):
+            return
+        if days > 0:
+            draft[field] = max(1, min(3650, days))
+        return
+
+    if field == "deadline":
+        deadline = _coerce_deadline(value)
+        if deadline:
+            draft[field] = deadline
+        return
+
+    if field == "goal_type":
+        goal_type = _normalize_goal_type(value)
+        if goal_type:
+            draft[field] = goal_type
+        return
+
+    if field == "priority":
+        try:
+            draft[field] = max(1, min(5, int(value)))
+        except (TypeError, ValueError):
+            pass
+        return
+
+    if field == "tags":
+        tags = _normalize_text_list(value)
+        if tags:
+            draft[field] = tags[:8]
+        return
+
+    if field == "classification":
+        classification = str(value or "").strip()
+        if classification in _VALID_REQUIREMENT_CLASSIFICATIONS:
+            draft[field] = classification
+        return
+
+    if field in {
+        "goal_name",
+        "purpose",
+        "current_level",
+        "target_level",
+        "preference",
+        "existing_goal_id",
+    }:
+        text_value = str(value).strip()
+        if text_value:
+            draft[field] = text_value[:160]
+
+
+def _apply_requirement_updates(
+    draft: Dict[str, Any], updates: Dict[str, Any]
+) -> Dict[str, Any]:
+    for field, value in updates.items():
+        if field in _REQUIREMENT_DRAFT_FIELDS or field == "classification":
+            _apply_requirement_field(draft, field, value)
+    return draft
+
+
+def _finalize_requirement_draft(
+    draft: Dict[str, Any],
+    text: str,
+    goals: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    if draft.get("timeframe_days") and not draft.get("timeframe"):
+        try:
+            draft["timeframe"] = f"{int(draft['timeframe_days'])}天"
+        except (TypeError, ValueError):
+            pass
+
+    if draft.get("timeframe_days") and not draft.get("deadline"):
+        try:
+            draft["deadline"] = (
+                _local_today() + timedelta(days=int(draft["timeframe_days"]))
+            ).isoformat()
+        except (TypeError, ValueError):
+            pass
+
+    if draft.get("deadline") and not draft.get("timeframe_days"):
+        days = _days_until(draft["deadline"])
+        if days:
+            draft["timeframe"] = f"{days}天"
+            draft["timeframe_days"] = days
+
+    if not draft.get("tags"):
+        draft["tags"] = _derive_tags(draft, text)
+
+    existing_goal_id = draft.get("existing_goal_id")
+    if draft.get("classification") not in _VALID_REQUIREMENT_CLASSIFICATIONS:
+        draft["classification"] = _classify_requirement(
+            text, draft, goals, existing_goal_id if isinstance(existing_goal_id, str) else None
+        )
+
+    related = _related_goals(draft, goals)
+    if (
+        draft["classification"] == "goal_extension"
+        and existing_goal_id
+        and related
+        and not draft.get("existing_goal_id")
+    ):
+        draft["existing_goal_id"] = related[0]["id"]
+    return draft
+
+
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+
+    fence_match = re.search(
+        r"```(?:json)?\s*([\s\S]*?)\s*```",
+        raw,
+        re.IGNORECASE,
+    )
+    if fence_match:
+        raw = fence_match.group(1).strip()
+
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    try:
+        parsed = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _strip_skill_frontmatter(content: str) -> str:
+    text = content.lstrip("\ufeff")
+    if not text.startswith("---"):
+        return text.strip()
+
+    match = re.match(r"^---\s*\n.*?\n---\s*\n?", text, re.DOTALL)
+    if not match:
+        return text.strip()
+    return text[match.end() :].strip()
+
+
+def _load_learning_skill(skill_name: str) -> str:
+    skill_dir_name = _LEARNING_SKILL_DIRS.get(skill_name)
+    if not skill_dir_name:
+        raise LearningSkillError(skill_name, f"Unknown learning skill: {skill_name}")
+
+    skill_path = _LEARNING_SKILLS_DIR / skill_dir_name / "SKILL.md"
+    try:
+        content = skill_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise LearningSkillError(
+            skill_name,
+            f"Learning skill file is unavailable: {skill_path}",
+        ) from exc
+
+    body = _strip_skill_frontmatter(content)
+    if not body:
+        raise LearningSkillError(skill_name, f"Learning skill is empty: {skill_path}")
+    return body
+
+
+def _learning_skill_system_message(skill_name: str) -> str:
+    return (
+        f"{_load_learning_skill(skill_name)}\n\n"
+        "Runtime contract: return exactly one JSON object that matches this skill's schema. "
+        "Do not return Markdown, comments, code fences, or explanatory text."
+    )
+
+
+def _extract_learning_llm_text(response: Any) -> str:
+    try:
+        message = response.choices[0].message
+        parsed = getattr(message, "parsed", None)
+        if isinstance(parsed, dict):
+            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text") if part.get("type") == "text" else None
+                else:
+                    text = getattr(part, "text", None)
+                if isinstance(text, str):
+                    parts.append(text)
+            return "".join(parts)
+    except (AttributeError, IndexError, TypeError):
+        pass
+    if isinstance(response, dict):
+        try:
+            message = response["choices"][0]["message"]
+            parsed = message.get("parsed") if isinstance(message, dict) else None
+            if isinstance(parsed, dict):
+                return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, str):
+                return content
+        except (KeyError, IndexError, TypeError):
+            pass
+    return ""
+
+
+def _learning_json_response_format(label: str) -> Dict[str, Any]:
+    if label == "course-planner":
+        return {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "course_plan",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["g", "p"],
+                        "properties": {
+                            "g": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["n", "d", "type", "h", "tags", "pre"],
+                                "properties": {
+                                    "n": {"type": "string"},
+                                    "d": {"type": "string"},
+                                    "type": {
+                                        "type": "string",
+                                        "enum": ["skill", "knowledge", "certification", "project"],
+                                    },
+                                    "h": {"type": "number"},
+                                    "tags": {"type": "array", "items": {"type": "string"}},
+                                    "pre": {"type": "array", "items": {"type": "string"}},
+                                },
+                            },
+                            "p": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "required": ["n", "d", "t"],
+                                    "properties": {
+                                        "n": {"type": "string"},
+                                        "d": {"type": "string"},
+                                        "t": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "additionalProperties": False,
+                                                "required": ["t", "d", "diff", "m", "p"],
+                                                "properties": {
+                                                    "t": {"type": "string"},
+                                                    "d": {"type": "string"},
+                                                    "diff": {
+                                                        "type": "string",
+                                                        "enum": ["easy", "medium", "hard"],
+                                                    },
+                                                    "m": {"type": "integer"},
+                                                    "p": {"type": "integer"},
+                                                },
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            }
+        }
+    return {"response_format": {"type": "json_object"}}
+
+
+def _learning_auxiliary_task_name(label: str) -> str:
+    return f"learning_{re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_') or 'json'}"
+
+
+def _current_learning_model_config() -> tuple[str, Optional[str]]:
+    env_model = (
+        os.environ.get("HERMES_MODEL", "")
+        or os.environ.get("HERMES_INFERENCE_MODEL", "")
+    ).strip()
+    cfg = {}
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+    except Exception:
+        _log.debug("Failed to load config for learning model", exc_info=True)
+
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    provider = os.environ.get("HERMES_TUI_PROVIDER", "").strip() or None
+    model = env_model
+
+    if isinstance(model_cfg, dict):
+        if not model:
+            model = str(
+                model_cfg.get("default")
+                or model_cfg.get("model")
+                or model_cfg.get("name")
+                or ""
+            ).strip()
+        provider = provider or str(model_cfg.get("provider") or "").strip() or None
+    elif isinstance(model_cfg, str):
+        model = model or model_cfg.strip()
+
+    return model or "anthropic/claude-sonnet-4", provider
+
+
+def _load_learning_provider_routing() -> Dict[str, Any]:
+    try:
+        from hermes_cli.config import load_config
+
+        routing = (load_config() or {}).get("provider_routing", {}) or {}
+        return routing if isinstance(routing, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_learning_fallback_model() -> List[Dict[str, Any]]:
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        return get_fallback_chain(load_config() or {})
+    except Exception:
+        return []
+
+
+def _build_learning_llm_agent(max_tokens: Optional[int] = None):
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from run_agent import AIAgent
+
+    model, provider = _current_learning_model_config()
+    runtime = resolve_runtime_provider(requested=provider, target_model=model)
+    routing = _load_learning_provider_routing()
+    agent = AIAgent(
+        model=model,
+        max_iterations=_LEARNING_LLM_MAX_ITERATIONS,
+        provider=runtime.get("provider"),
+        base_url=runtime.get("base_url"),
+        api_key=runtime.get("api_key"),
+        api_mode=runtime.get("api_mode"),
+        acp_command=runtime.get("command"),
+        acp_args=runtime.get("args"),
+        credential_pool=runtime.get("credential_pool"),
+        quiet_mode=True,
+        enabled_toolsets=[],
+        providers_allowed=routing.get("only"),
+        providers_ignored=routing.get("ignore"),
+        providers_order=routing.get("order"),
+        provider_sort=routing.get("sort"),
+        provider_require_parameters=routing.get("require_parameters", False),
+        provider_data_collection=routing.get("data_collection"),
+        platform="desktop",
+        session_id=f"learning-{_generate_id()}",
+        skip_context_files=True,
+        skip_memory=True,
+        fallback_model=_load_learning_fallback_model(),
+        max_tokens=max_tokens,
+    )
+    agent._persist_disabled = True
+    agent._session_db = None
+    return agent
+
+
+def _call_learning_llm_json(
+    *,
+    system_message: str,
+    payload: Dict[str, Any],
+    label: str,
+    max_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    user_message = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    try:
+        from agent.auxiliary_client import call_llm
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        model, provider = _current_learning_model_config()
+        runtime = resolve_runtime_provider(requested=provider, target_model=model)
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_message},
+        ]
+
+        def call_once(extra_body: Optional[Dict[str, Any]]):
+            return call_llm(
+                task=_learning_auxiliary_task_name(label),
+                provider=runtime.get("provider"),
+                model=model,
+                base_url=runtime.get("base_url"),
+                api_key=runtime.get("api_key"),
+                api_mode=runtime.get("api_mode"),
+                main_runtime=runtime,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=max_tokens,
+                timeout=_LEARNING_LLM_BACKGROUND_TIMEOUT_SECONDS,
+                extra_body=extra_body,
+            )
+
+        used_response_format = True
+        try:
+            response = call_once(_learning_json_response_format(label))
+        except Exception as exc:
+            error_text = str(exc).lower()
+            if (
+                "response_format" not in error_text
+                and "json_object" not in error_text
+                and "json_schema" not in error_text
+                and "schema" not in error_text
+            ):
+                raise
+            _log.info(
+                "Learning LLM provider rejected JSON response_format for %s; retrying with prompt-only JSON contract",
+                label,
+            )
+            used_response_format = False
+            response = call_once(None)
+    except Exception:
+        _log.exception("Learning LLM call failed for %s", label)
+        return {}
+
+    text = _extract_learning_llm_text(response)
+    parsed = _extract_json_object(text)
+    if not parsed and used_response_format:
+        _log.info(
+            "Learning LLM returned no usable JSON for %s with response_format; retrying same model without response_format",
+            label,
+        )
+        try:
+            response = call_once(None)
+        except Exception:
+            _log.exception("Learning LLM prompt-only retry failed for %s", label)
+            return {}
+        text = _extract_learning_llm_text(response)
+        parsed = _extract_json_object(text)
+
+    if not parsed:
+        _log.warning("Learning LLM returned non-JSON for %s: %s", label, text[:500])
+    return parsed
+
+
+def _invoke_learning_llm_json_for_thread(
+    *,
+    system_message: str,
+    payload: Dict[str, Any],
+    label: str,
+    max_tokens: Optional[int],
+) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "system_message": system_message,
+        "payload": payload,
+        "label": label,
+    }
+    if max_tokens is not None:
+        try:
+            signature = inspect.signature(_call_learning_llm_json)
+            supports_max_tokens = "max_tokens" in signature.parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+        except (TypeError, ValueError):
+            supports_max_tokens = False
+        if supports_max_tokens:
+            kwargs["max_tokens"] = max_tokens
+
+    return _call_learning_llm_json(**kwargs)
+
+
+async def _call_learning_llm_json_async(
+    *,
+    system_message: str,
+    payload: Dict[str, Any],
+    label: str,
+    timeout_seconds: Optional[float] = None,
+    required: bool = False,
+    max_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    call = asyncio.to_thread(
+        _invoke_learning_llm_json_for_thread,
+        system_message=system_message,
+        payload=payload,
+        label=label,
+        max_tokens=max_tokens,
+    )
+    if timeout_seconds is None:
+        result = await call
+        if required and not result:
+            raise LearningSkillError(
+                label,
+                f"{label} did not return a valid JSON object",
+            )
+        return result
+
+    try:
+        result = await asyncio.wait_for(call, timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        _log.warning(
+            "Learning skill call timed out for %s after %.1fs",
+            label,
+            timeout_seconds,
+        )
+        if required:
+            raise LearningSkillTimeoutError(label, timeout_seconds)
+        return {}
+
+    if required and not result:
+        raise LearningSkillError(
+            label,
+            f"{label} did not return a valid JSON object",
+        )
+    return result
+
+
+def _learning_skill_http_exception(exc: LearningSkillError) -> HTTPException:
+    if isinstance(exc, LearningSkillTimeoutError):
+        if exc.skill_name == "course-planner":
+            message = "模型仍在生成学习计划，已保留本次请求；请稍后重试，会复用同一次模型结果。"
+        else:
+            message = "模型生成超时，请稍后重试，或把学习周期、基础和每天可用时间写得更具体。"
+    else:
+        message = "模型没有返回可用的结构化结果，请重试或补充更明确的学习需求。"
+    return HTTPException(
+        status_code=exc.status_code,
+        detail={
+            "message": message,
+            "skill": exc.skill_name,
+        },
+    )
+
+
+def _compact_goals_for_prompt(
+    goals: Dict[str, Dict[str, Any]], limit: int = 8
+) -> List[Dict[str, Any]]:
+    active_goals = [
+        goal
+        for goal in goals.values()
+        if str(goal.get("status") or "") not in _INACTIVE_GOAL_STATUSES
+    ]
+    active_goals.sort(key=lambda goal: str(goal.get("updated_at") or ""), reverse=True)
+    return [
+        {
+            "id": goal.get("id"),
+            "name": goal.get("name"),
+            "description": goal.get("description"),
+            "goal_type": goal.get("goal_type"),
+            "status": goal.get("status"),
+            "progress": goal.get("progress", 0),
+            "tags": goal.get("tags", []),
+        }
+        for goal in active_goals[:limit]
+    ]
+
+
+async def _generate_requirement_draft_with_llm(
+    *,
+    message: str,
+    answers: Dict[str, Any],
+    profile: Dict[str, Any],
+    goals: Dict[str, Dict[str, Any]],
+    existing_goal_id: Optional[str],
+) -> Dict[str, Any]:
+    system_message = _learning_skill_system_message("requirement-intake")
+    payload = {
+        "today": _local_today().isoformat(),
+        "message": message,
+        "answers": answers,
+        "student_profile": _compact_profile_context(profile),
+        "existing_goal_id": existing_goal_id,
+        "active_goals": _compact_goals_for_prompt(goals),
+    }
+    parsed = await _call_learning_llm_json_async(
+        system_message=system_message,
+        payload=payload,
+        label="requirement-intake",
+        timeout_seconds=_LEARNING_REQUIREMENT_LLM_TIMEOUT_SECONDS,
+        max_tokens=_LEARNING_REQUIREMENT_MAX_OUTPUT_TOKENS,
+    )
+    draft = parsed.get("draft") if isinstance(parsed.get("draft"), dict) else parsed
+    return draft if isinstance(draft, dict) else {}
+
+
+def _build_requirement_draft(
+    text: str,
+    answers: Dict[str, Any],
+    goals: Dict[str, Dict[str, Any]],
+    existing_goal_id: Optional[str],
+    profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    clean_text = text.strip()
+    purpose = _infer_purpose(clean_text)
+    effective_purpose = purpose or _purpose_from_career_target(
+        str(profile.get("career_target") or "")
+    )
+    profile_preferences = _normalize_text_list(profile.get("learning_preferences"))
+    profile_daily_minutes = _profile_average_daily_minutes(profile)
+    goal_name = _extract_goal_name(clean_text)
+    if not effective_purpose and goal_name:
+        effective_purpose = _SYSTEM_LEARNING_PURPOSE
+    goal_type = _infer_goal_type(clean_text, effective_purpose)
+    target_level = _infer_target_level(clean_text) or (
+        _default_target_level(goal_type, effective_purpose, goal_name)
+        if goal_name
+        else None
+    )
+    draft: Dict[str, Any] = {
+        "raw_text": clean_text,
+        "goal_name": goal_name,
+        "purpose": effective_purpose,
+        "current_level": _infer_current_level(clean_text)
+        or str(profile.get("baseline_level") or "").strip()
+        or None,
+        "target_level": target_level,
+        "daily_minutes": _extract_daily_minutes(clean_text) or profile_daily_minutes,
+        "deadline": _extract_deadline(clean_text),
+        "preference": _infer_preference(clean_text)
+        or (profile_preferences[0] if profile_preferences else None),
+        "goal_type": goal_type,
+        "priority": 2,
+        "student_context": _student_context_from_profile(profile),
+        "time_constraints": _time_constraints_from_profile(profile),
+    }
+
+    timeframe = _extract_timeframe(clean_text)
+    if timeframe:
+        draft["timeframe"] = timeframe["label"]
+        draft["timeframe_days"] = timeframe["days"]
+
+    if existing_goal_id:
+        draft["existing_goal_id"] = existing_goal_id
+
+    _apply_requirement_updates(draft, answers)
+    return _finalize_requirement_draft(draft, clean_text, goals)
+
+
+def _missing_requirement_fields(draft: Dict[str, Any]) -> List[str]:
+    missing = []
+    for field in _REQUIRED_REQUIREMENT_FIELDS:
+        if field == "timeframe":
+            if (
+                not draft.get("timeframe")
+                and not draft.get("deadline")
+                and not draft.get("timeframe_days")
+            ):
+                missing.append(field)
+            continue
+        if field == "daily_minutes":
+            if not draft.get(field):
+                missing.append(field)
+            continue
+        if _blank(draft.get(field)):
+            missing.append(field)
+    return missing
+
+
+def _requirement_questions(missing: List[str]) -> List[Dict[str, Any]]:
+    return [
+        {"field": field, **_FIELD_QUESTIONS[field]}
+        for field in missing
+        if field in _FIELD_QUESTIONS
+    ]
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _dynamic_requirement_estimate(draft: Dict[str, Any]) -> Dict[str, Any]:
+    goal_type = str(draft.get("goal_type") or "skill")
+    goal_name = str(draft.get("goal_name") or "")
+    purpose = str(draft.get("purpose") or "")
+    current_level = str(draft.get("current_level") or "")
+    target_level = str(draft.get("target_level") or "")
+    preference = str(draft.get("preference") or "")
+    tags = " ".join(str(tag) for tag in draft.get("tags", []) or [])
+    student_context = draft.get("student_context") if isinstance(draft.get("student_context"), dict) else {}
+    time_constraints = draft.get("time_constraints") if isinstance(draft.get("time_constraints"), dict) else {}
+    strengths = str(student_context.get("strengths") or "")
+    weaknesses = str(student_context.get("weaknesses") or "")
+    current_courses = " ".join(str(item) for item in student_context.get("current_courses", []) or [])
+    major = str(student_context.get("major") or "")
+    profile_text = " ".join([major, strengths, weaknesses, current_courses])
+    full_text = " ".join([goal_name, purpose, target_level, preference, tags, profile_text]).lower()
+
+    topic_hours = [
+        (("高等数学", "高数", "calculus"), 96.0),
+        (("数据结构", "算法"), 88.0),
+        (("线性代数", "线代"), 64.0),
+        (("概率论", "数理统计"), 72.0),
+        (("大学物理", "大物"), 72.0),
+        (("考研数学",), 180.0),
+        (("英语六级", "英语四级", "四六级"), 76.0),
+        (("java", "后端", "spring"), 132.0),
+        (("python", "数据分析"), 86.0),
+        (("react", "vue", "前端"), 82.0),
+        (("机器学习", "深度学习", "人工智能"), 128.0),
+    ]
+    base_hours = None
+    for keywords, hours in topic_hours:
+        if any(keyword.lower() in full_text for keyword in keywords):
+            base_hours = hours
+            break
+
+    if base_hours is None:
+        base_hours = {
+            "skill": 90.0,
+            "knowledge": 62.0,
+            "certification": 118.0,
+            "project": 86.0,
+        }.get(goal_type, 74.0)
+
+    if any(word in current_level for word in ["零基础", "入门", "薄弱"]):
+        base_hours *= 1.22
+    elif any(word in current_level for word in ["初级", "一般"]):
+        base_hours *= 1.08
+    elif any(word in current_level for word in ["中级", "熟悉"]):
+        base_hours *= 0.86
+    elif any(word in current_level for word in ["高级", "熟练"]):
+        base_hours *= 0.72
+
+    if any(word in target_level + purpose for word in ["保研", "考研", "竞赛", "面试", "就业"]):
+        base_hours *= 1.18
+    elif any(word in target_level + purpose for word in ["期末", "考试", "通过"]):
+        base_hours *= 1.08
+    elif any(word in target_level for word in ["快速了解", "入门了解"]):
+        base_hours *= 0.68
+
+    if any(word in weaknesses for word in ["薄弱", "差", "不会", "不熟", "欠缺", "数学", "算法", goal_name]):
+        base_hours *= 1.12
+    if any(word in strengths for word in ["数学", "算法", "编程", "项目", "基础好", "熟悉"]):
+        base_hours *= 0.92
+    if goal_name and goal_name in current_courses:
+        base_hours *= 0.9
+    if major and _is_computing_major(major) and any(word in full_text for word in ["编程", "开发", "后端", "前端", "数据结构", "算法"]):
+        base_hours *= 0.92
+    elif major and not _is_computing_major(major) and any(word in full_text for word in ["编程", "开发", "算法", "机器学习"]):
+        base_hours *= 1.1
+    if "刷题" in preference:
+        base_hours *= 1.04
+    elif any(word in preference for word in ["项目", "实战"]):
+        base_hours *= 1.08
+
+    weekday_minutes = _normalize_minutes(time_constraints.get("weekday_minutes"))
+    weekend_minutes = _normalize_minutes(time_constraints.get("weekend_minutes"))
+    weekly_minutes = _normalize_minutes(time_constraints.get("weekly_minutes"))
+    if weekly_minutes is None and (weekday_minutes is not None or weekend_minutes is not None):
+        weekly_minutes = (weekday_minutes or 0) * 5 + (weekend_minutes or weekday_minutes or 0) * 2
+
+    daily_minutes = _normalize_minutes(draft.get("daily_minutes"))
+    if weekly_minutes and weekly_minutes > 0:
+        daily_hours = weekly_minutes / 7 / 60
+    else:
+        daily_hours = float(daily_minutes or 0) / 60
+
+    available_days_value = _float_or_none(draft.get("timeframe_days"))
+    available_days = int(available_days_value) if available_days_value and available_days_value > 0 else _days_until(draft.get("deadline"))
+    available_hours = round(float(available_days) * daily_hours, 1) if available_days and daily_hours else None
+    base_hours = round(max(12.0, min(500.0, base_hours)), 1)
+    estimated_days = int(round(base_hours / daily_hours + 0.499)) if daily_hours else None
+
+    if available_hours:
+        ratio = available_hours / base_hours
+        confidence = round(min(0.95, max(0.25, ratio)), 2)
+        fit = "comfortable" if ratio >= 1.15 else "tight" if ratio >= 0.75 else "at_risk"
+    else:
+        confidence = 0.55
+        fit = "unknown"
+
+    if any(word in purpose + target_level for word in ["考试", "通过", "保研", "考研"]):
+        phase_specs = [
+            ("诊断与路线", 0.18),
+            ("核心输入", 0.32),
+            ("练习实战", 0.36),
+            ("复盘冲刺", 0.14),
+        ]
+    elif any(word in preference + goal_type for word in ["项目", "project"]):
+        phase_specs = [
+            ("诊断与路线", 0.12),
+            ("核心输入", 0.28),
+            ("练习实战", 0.45),
+            ("复盘冲刺", 0.15),
+        ]
+    else:
+        phase_specs = [
+            ("诊断与路线", 0.15),
+            ("核心输入", 0.35),
+            ("练习实战", 0.35),
+            ("复盘冲刺", 0.15),
+        ]
+
+    phases = []
+    for name, weight in phase_specs:
+        phase_hours = round(base_hours * weight, 1)
+        phase_days = int(round(phase_hours / daily_hours + 0.499)) if daily_hours else None
+        phases.append({"name": name, "hours": phase_hours, "days": phase_days})
+
+    return {
+        "estimated_hours": base_hours,
+        "estimated_days": estimated_days,
+        "available_days": available_days,
+        "available_hours": available_hours,
+        "confidence": confidence,
+        "fit": fit,
+        "phases": phases,
+    }
+
+
+def _estimate_requirement(draft: Dict[str, Any]) -> Dict[str, Any]:
+    return _dynamic_requirement_estimate(draft)
+
+
+def _requirement_period_days(
+    draft: Dict[str, Any], estimate: Optional[Dict[str, Any]] = None
+) -> Optional[int]:
+    value = _float_or_none(draft.get("timeframe_days"))
+    if value and value > 0:
+        return max(1, int(round(value)))
+
+    deadline_days = _days_until(draft.get("deadline"))
+    if deadline_days:
+        return max(1, deadline_days)
+
+    if isinstance(estimate, dict):
+        estimated_days = _float_or_none(estimate.get("available_days"))
+        if estimated_days and estimated_days > 0:
+            return max(1, int(round(estimated_days)))
+
+    return None
+
+
+def _sync_requirement_daily_minutes(
+    draft: Dict[str, Any], estimate: Dict[str, Any]
+) -> Dict[str, Any]:
+    estimated_hours = _float_or_none(estimate.get("estimated_hours"))
+    period_days = _requirement_period_days(draft, estimate)
+    if estimated_hours and period_days:
+        draft["daily_minutes"] = max(
+            1,
+            min(14 * 60, int(round(estimated_hours * 60 / period_days))),
+        )
+    return draft
+
+
+def _goal_description_from_requirement(draft: Dict[str, Any]) -> str:
+    student_context = draft.get("student_context") or {}
+    time_constraints = draft.get("time_constraints") or {}
+    parts = [
+        f"目标：{draft.get('goal_name')}",
+        f"用途：{draft.get('purpose')}",
+        f"基础：{draft.get('current_level')}",
+        f"目标水平：{draft.get('target_level')}",
+        f"学习偏好：{draft.get('preference')}",
+    ]
+    if student_context.get("major") or student_context.get("grade"):
+        parts.append(
+            f"学生画像：{student_context.get('grade') or '-'}，"
+            f"{student_context.get('major') or '-'}"
+        )
+    if time_constraints.get("weekly_minutes") is not None:
+        parts.append(
+            f"时间约束：工作日 {time_constraints.get('weekday_minutes') or 0} 分钟/天，"
+            f"周末 {time_constraints.get('weekend_minutes') or 0} 分钟/天"
+        )
+    if student_context.get("constraints"):
+        parts.append(f"近期限制：{student_context.get('constraints')}")
+    if draft.get("raw_text"):
+        parts.append(f"原始需求：{draft.get('raw_text')}")
+    return "\n".join(part for part in parts if part)
+
+
+def _minutes_for_study_date(day: Any, draft: Dict[str, Any]) -> int:
+    daily_minutes = int(draft.get("daily_minutes") or 60)
+    constraints = draft.get("time_constraints") or {}
+    weekday = _normalize_minutes(constraints.get("weekday_minutes"))
+    weekend = _normalize_minutes(constraints.get("weekend_minutes"))
+    if weekday is None and weekend is None:
+        return max(20, min(180, daily_minutes))
+    if weekday == 0 and weekend == 0:
+        return max(20, min(180, daily_minutes))
+    minutes = weekend if day.weekday() >= 5 else weekday
+    if minutes is None:
+        minutes = daily_minutes
+    return max(0, min(240, minutes))
+
+
+def _coerce_positive_int(value: Any, default: int, *, minimum: int = 1, maximum: int = 10_000) -> int:
+    try:
+        parsed = int(round(float(value)))
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_positive_float(value: Any, default: float, *, minimum: float = 1.0, maximum: float = 10_000.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return round(max(minimum, min(maximum, parsed)), 1)
+
+
+def _text_or_empty(value: Any, limit: int = 400) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def _task_scheduled_date(task: Dict[str, Any]) -> Optional[date]:
+    parsed = _parse_datetime(str(task.get("scheduled_date") or ""))
+    return parsed.date() if parsed else None
+
+
+def _task_scheduled_day(
+    task: Dict[str, Any], fallback_day: date
+) -> date:
+    return _task_scheduled_date(task) or fallback_day
+
+
+def _profile_daily_capacity(day: date, profile: Dict[str, Any]) -> int:
+    weekday_minutes = _normalize_minutes(profile.get("weekday_minutes"))
+    weekend_minutes = _normalize_minutes(profile.get("weekend_minutes"))
+    if weekday_minutes == 0 and weekend_minutes == 0:
+        return 60
+    minutes = weekend_minutes if day.weekday() >= 5 else weekday_minutes
+    if minutes is None:
+        minutes = _profile_average_daily_minutes(profile) or 60
+    return max(0, min(8 * 60, minutes))
+
+
+def _task_remaining_minutes(task: Dict[str, Any]) -> int:
+    if task.get("status") == TaskStatus.COMPLETED.value:
+        return 0
+    return _coerce_positive_int(
+        task.get("estimated_minutes"),
+        30,
+        minimum=1,
+        maximum=14 * 60,
+    )
+
+
+def _goal_target_day(goal: Dict[str, Any]) -> Optional[date]:
+    parsed = _parse_datetime(str(goal.get("target_date") or ""))
+    return _local_date_from(parsed) if parsed else None
+
+
+def _goal_remaining_minutes(
+    goal_id: str,
+    tasks: Dict[str, Dict[str, Any]],
+    goals: Dict[str, Dict[str, Any]],
+) -> int:
+    return sum(
+        _task_remaining_minutes(task)
+        for task in tasks.values()
+        if str(task.get("goal_id") or "") == goal_id
+        and _is_daily_schedule_eligible(task, goals)
+    )
+
+
+def _deadline_pressure_capacity(
+    today: date,
+    tasks: Dict[str, Dict[str, Any]],
+    goals: Dict[str, Dict[str, Any]],
+) -> int:
+    pressure_minutes = 0
+
+    for goal_id, goal in goals.items():
+        if str(goal.get("status") or "") in _INACTIVE_GOAL_STATUSES:
+            continue
+        target_day = _goal_target_day(goal)
+        if not target_day:
+            continue
+        remaining_minutes = _goal_remaining_minutes(goal_id, tasks, goals)
+        if remaining_minutes <= 0:
+            continue
+        days_left = max(1, (target_day - today).days)
+        pressure_minutes += max(1, int((remaining_minutes + days_left - 1) // days_left))
+
+    return min(14 * 60, pressure_minutes)
+
+
+def _dynamic_daily_capacity(
+    today: date,
+    profile: Dict[str, Any],
+    tasks: Dict[str, Dict[str, Any]],
+    goals: Dict[str, Dict[str, Any]],
+) -> int:
+    base_capacity = _profile_daily_capacity(today, profile)
+    if base_capacity <= 0:
+        return 0
+
+    pressure_capacity = _deadline_pressure_capacity(today, tasks, goals)
+    if pressure_capacity <= 0:
+        return base_capacity
+
+    return min(14 * 60, max(base_capacity, pressure_capacity))
+
+
+def _plan_position(plan: Dict[str, Any], fallback: int) -> int:
+    position = _int_or_none(plan.get("position"))
+    return position if position is not None else fallback
+
+
+def _plan_order_by_id(plans: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, int]:
+    source = plans if plans is not None else _load_plans()
+
+    return {
+        str(plan.get("id") or plan_id): _plan_position(plan, index)
+        for index, (plan_id, plan) in enumerate(source.items())
+        if isinstance(plan, dict)
+    }
+
+
+def _plan_sort_key(plan: Dict[str, Any], fallback: int = 0) -> tuple:
+    return (
+        _plan_position(plan, fallback),
+        str(plan.get("created_at") or ""),
+        str(plan.get("id") or ""),
+    )
+
+
+def _next_plan_position(plans: Dict[str, Dict[str, Any]], goal_id: str) -> int:
+    positions = [
+        _plan_position(plan, index)
+        for index, plan in enumerate(plans.values())
+        if str(plan.get("goal_id") or "") == goal_id
+    ]
+
+    return (max(positions) + 1) if positions else 0
+
+
+def _daily_task_sort_key(
+    task: Dict[str, Any],
+    today: date,
+    plan_order_by_id: Optional[Dict[str, int]] = None,
+) -> tuple:
+    scheduled_date = _task_scheduled_date(task)
+    if scheduled_date and scheduled_date < today:
+        schedule_rank = 0
+    elif scheduled_date is None:
+        schedule_rank = 1
+    elif scheduled_date == today:
+        schedule_rank = 2
+    else:
+        schedule_rank = 3
+    scheduled_day = scheduled_date or today
+    plan_order = (plan_order_by_id or {}).get(str(task.get("plan_id") or ""), 0)
+    return (
+        plan_order,
+        int(task.get("position") or 0),
+        schedule_rank,
+        scheduled_day.isoformat(),
+        int(task.get("priority") or 3),
+        str(task.get("created_at") or ""),
+        str(task.get("id") or ""),
+    )
+
+
+def _is_daily_schedule_eligible(
+    task: Dict[str, Any], goals: Dict[str, Dict[str, Any]]
+) -> bool:
+    if task.get("status") == TaskStatus.COMPLETED.value:
+        return False
+    goal_id = str(task.get("goal_id") or "")
+    goal = goals.get(goal_id)
+    if not goal:
+        return True
+    return str(goal.get("status") or "") not in _INACTIVE_GOAL_STATUSES
+
+
+def _goal_schedule_sort_key(
+    goal_id: str,
+    bucket: List[Dict[str, Any]],
+    goals: Dict[str, Dict[str, Any]],
+    today: date,
+) -> tuple:
+    goal = goals.get(goal_id) or {}
+    target = _parse_datetime(str(goal.get("target_date") or ""))
+    target_day = _local_date_from(target) if target else None
+    if target_day:
+        days_left = max(-3650, (target_day - today).days)
+    else:
+        days_left = 3650
+    progress = _float_or_none(goal.get("progress")) or 0.0
+    first_task_key = _daily_task_sort_key(bucket[0], today) if bucket else ()
+    return (days_left, progress, first_task_key, str(goal.get("created_at") or ""))
+
+
+def _ordered_pending_tasks_for_daily_schedule(
+    tasks: Dict[str, Dict[str, Any]],
+    goals: Dict[str, Dict[str, Any]],
+    today: date,
+    plans: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    plan_order_by_id = _plan_order_by_id(plans)
+    for task in tasks.values():
+        if not _is_daily_schedule_eligible(task, goals):
+            continue
+        goal_id = str(task.get("goal_id") or task.get("id") or "")
+        buckets.setdefault(goal_id, []).append(task)
+
+    for bucket in buckets.values():
+        bucket.sort(key=lambda task: _daily_task_sort_key(task, today, plan_order_by_id))
+
+    goal_ids = sorted(
+        buckets,
+        key=lambda goal_id: _goal_schedule_sort_key(goal_id, buckets[goal_id], goals, today),
+    )
+    ordered: List[Dict[str, Any]] = []
+
+    while any(buckets[goal_id] for goal_id in goal_ids):
+        for goal_id in goal_ids:
+            if buckets[goal_id]:
+                ordered.append(buckets[goal_id].pop(0))
+
+    return ordered
+
+
+def _refresh_today_task_schedule(
+    tasks: Dict[str, Dict[str, Any]],
+    goals: Dict[str, Dict[str, Any]],
+    profile: Dict[str, Any],
+    now: datetime,
+    *,
+    force: bool = False,
+    plans: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> bool:
+    today = _local_date_from(now)
+    today_key = today.isoformat()
+    state = _load_schedule_state()
+    if (
+        not force
+        and state.get("last_today_schedule_date") == today_key
+        and state.get("today_schedule_version") == _TODAY_SCHEDULE_VERSION
+    ):
+        return False
+
+    capacity = _dynamic_daily_capacity(today, profile, tasks, goals)
+    used_minutes = sum(
+        _coerce_positive_int(
+            task.get("estimated_minutes"), 30, minimum=1, maximum=8 * 60
+        )
+        for task in tasks.values()
+        if task.get("status") == TaskStatus.COMPLETED.value
+        and _task_scheduled_date(task) == today
+    )
+    changed = False
+    scheduled_ids: set[str] = set()
+    pending_tasks = _ordered_pending_tasks_for_daily_schedule(tasks, goals, today, plans)
+
+    for task in pending_tasks:
+        duration = _coerce_positive_int(
+            task.get("estimated_minutes"), 30, minimum=1, maximum=8 * 60
+        )
+        fits_today = capacity > 0 and (used_minutes == 0 or used_minutes + duration <= capacity)
+        next_date = today_key if fits_today else ""
+        previous_date = str(task.get("scheduled_date") or "")
+        if previous_date != next_date:
+            task["scheduled_date"] = next_date
+            task["updated_at"] = now.isoformat()
+            changed = True
+        if fits_today:
+            scheduled_ids.add(str(task.get("id") or ""))
+            used_minutes += duration
+
+    for task in tasks.values():
+        if task.get("status") == TaskStatus.COMPLETED.value:
+            continue
+        if str(task.get("id") or "") in scheduled_ids:
+            continue
+        if _task_scheduled_date(task) == today:
+            task["scheduled_date"] = ""
+            task["updated_at"] = now.isoformat()
+            changed = True
+
+    state["last_today_schedule_date"] = today_key
+    state["today_schedule_version"] = _TODAY_SCHEDULE_VERSION
+    state["updated_at"] = now.isoformat()
+    _save_schedule_state(state)
+    return changed
+
+
+def _ahead_task_recommendations(
+    tasks: Dict[str, Dict[str, Any]],
+    goals: Dict[str, Dict[str, Any]],
+    today: date,
+    *,
+    plans: Optional[Dict[str, Dict[str, Any]]] = None,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    tomorrow_key = (today + timedelta(days=1)).isoformat()
+    recommendations: List[Dict[str, Any]] = []
+
+    for task in _ordered_pending_tasks_for_daily_schedule(tasks, goals, today, plans):
+        if _task_scheduled_date(task) == today:
+            continue
+        copied = dict(task)
+        copied["ahead"] = True
+        copied["ahead_reason"] = "今日任务已完成，可以作为明日任务提前推进。"
+        copied["recommended_for_date"] = tomorrow_key
+        copied["scheduled_date"] = tomorrow_key
+        recommendations.append(copied)
+        if len(recommendations) >= limit:
+            break
+
+    return recommendations
+
+
+def _clock_minutes(value: Any) -> Optional[int]:
+    text = str(value or "").strip()
+    match = re.search(r"([01]?\d|2[0-3]):([0-5]\d)", text)
+    if not match:
+        return None
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def _clock_label(minutes: int) -> str:
+    bounded = max(0, min(23 * 60 + 59, minutes))
+    return f"{bounded // 60:02d}:{bounded % 60:02d}"
+
+
+def _task_learning_feedback(task: Dict[str, Any]) -> Dict[str, Any]:
+    feedback = task.get("learning_feedback")
+    return feedback if isinstance(feedback, dict) else {}
+
+
+def _recent_feedback_for_goal(
+    goal_id: str,
+    tasks: Dict[str, Dict[str, Any]],
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    items = []
+    for task in tasks.values():
+        if str(task.get("goal_id") or "") != goal_id:
+            continue
+        feedback = _task_learning_feedback(task)
+        if not feedback:
+            continue
+        items.append(
+            {
+                "task_id": task.get("id"),
+                "task_title": task.get("title"),
+                "completed_at": task.get("completed_at"),
+                "actual_minutes": feedback.get("actual_minutes"),
+                "mastery_level": feedback.get("mastery_level"),
+                "summary": feedback.get("analysis", {}).get("summary") if isinstance(feedback.get("analysis"), dict) else "",
+                "risk_level": feedback.get("analysis", {}).get("risk_level") if isinstance(feedback.get("analysis"), dict) else "",
+                "next_focus": feedback.get("next_focus"),
+                "raw_feedback": feedback.get("feedback"),
+            }
+        )
+
+    items.sort(key=lambda item: str(item.get("completed_at") or ""), reverse=True)
+    return items[:limit]
+
+
+def _compact_learning_feedback(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+
+    analysis = value.get("analysis")
+    analysis_payload = analysis if isinstance(analysis, dict) else {}
+    return {
+        "actual_minutes": value.get("actual_minutes"),
+        "mastery_level": _text_or_empty(value.get("mastery_level"), 60),
+        "feedback": _text_or_empty(value.get("feedback"), 180),
+        "next_focus": _text_or_empty(value.get("next_focus"), 160),
+        "analysis_status": _text_or_empty(value.get("analysis_status"), 40),
+        "summary": _text_or_empty(analysis_payload.get("summary"), 160),
+        "risk_level": _text_or_empty(analysis_payload.get("risk_level"), 30),
+        "schedule_hint": _text_or_empty(analysis_payload.get("schedule_hint"), 160),
+    }
+
+
+def _compact_recent_feedback(items: List[Dict[str, Any]], limit: int = 2) -> List[Dict[str, Any]]:
+    compact: List[Dict[str, Any]] = []
+    for item in items[:limit]:
+        if not isinstance(item, dict):
+            continue
+        compact.append(
+            {
+                "task_title": _text_or_empty(item.get("task_title"), 100),
+                "actual_minutes": item.get("actual_minutes"),
+                "mastery_level": _text_or_empty(item.get("mastery_level"), 60),
+                "summary": _text_or_empty(item.get("summary"), 160),
+                "risk_level": _text_or_empty(item.get("risk_level"), 30),
+                "next_focus": _text_or_empty(item.get("next_focus"), 120),
+            }
+        )
+    return compact
+
+
+def _compact_goal_context(goal: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(goal, dict):
+        return {}
+
+    last_feedback = goal.get("last_learning_feedback")
+    last_feedback_payload = last_feedback if isinstance(last_feedback, dict) else {}
+    return {
+        "id": goal.get("id"),
+        "name": _text_or_empty(goal.get("name"), 120),
+        "description": _text_or_empty(goal.get("description"), 240),
+        "goal_type": goal.get("goal_type"),
+        "target_date": goal.get("target_date"),
+        "estimated_hours": goal.get("estimated_hours"),
+        "progress": goal.get("progress"),
+        "tags": _normalize_text_list(goal.get("tags"))[:5],
+        "last_learning_feedback": {
+            "task_title": _text_or_empty(last_feedback_payload.get("task_title"), 100),
+            "summary": _text_or_empty(last_feedback_payload.get("summary"), 140),
+            "mastery_signal": _text_or_empty(last_feedback_payload.get("mastery_signal"), 30),
+            "pace_signal": _text_or_empty(last_feedback_payload.get("pace_signal"), 30),
+            "risk_level": _text_or_empty(last_feedback_payload.get("risk_level"), 30),
+            "schedule_hint": _text_or_empty(last_feedback_payload.get("schedule_hint"), 140),
+        },
+    }
+
+
+def _compact_plan_context(plan: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(plan, dict):
+        return {}
+
+    return {
+        "id": plan.get("id"),
+        "name": _text_or_empty(plan.get("name"), 120),
+        "description": _text_or_empty(plan.get("description"), 200),
+        "total_tasks": plan.get("total_tasks"),
+        "completed_tasks": plan.get("completed_tasks"),
+    }
+
+
+def _compact_profile_context(profile: Dict[str, Any]) -> Dict[str, Any]:
+    status = _profile_status(profile)
+    return {
+        "major": _text_or_empty(profile.get("major"), 100),
+        "grade": _text_or_empty(profile.get("grade"), 60),
+        "baseline_level": _text_or_empty(profile.get("baseline_level"), 80),
+        "career_target": _text_or_empty(profile.get("career_target"), 120),
+        "weekday_minutes": profile.get("weekday_minutes"),
+        "weekend_minutes": profile.get("weekend_minutes"),
+        "preferred_study_time": _text_or_empty(profile.get("preferred_study_time"), 100),
+        "learning_preferences": _normalize_text_list(profile.get("learning_preferences"))[:4],
+        "current_courses": _normalize_text_list(profile.get("current_courses"))[:6],
+        "strengths": _text_or_empty(profile.get("strengths"), 160),
+        "weaknesses": _text_or_empty(profile.get("weaknesses"), 160),
+        "constraints": _text_or_empty(profile.get("constraints"), 160),
+        "complete": status["complete"],
+        "missing_fields": status["missing_fields"],
+    }
+
+
+def _compact_task_context(task: Dict[str, Any], *, include_id: bool = False) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "title": _text_or_empty(task.get("title"), 120),
+        "description": _text_or_empty(task.get("description"), 260),
+        "difficulty": task.get("difficulty"),
+        "estimated_minutes": task.get("estimated_minutes"),
+        "scheduled_date": task.get("scheduled_date"),
+        "priority": task.get("priority"),
+        "status": task.get("status"),
+        "learning_feedback": _compact_learning_feedback(_task_learning_feedback(task)),
+    }
+    if include_id:
+        payload["task_id"] = task.get("id")
+    return payload
+
+
+def _compact_requirement_draft_context(draft: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "goal_name": _text_or_empty(draft.get("goal_name"), 120),
+        "purpose": _text_or_empty(draft.get("purpose"), 120),
+        "current_level": _text_or_empty(draft.get("current_level"), 100),
+        "target_level": _text_or_empty(draft.get("target_level"), 160),
+        "daily_minutes": draft.get("daily_minutes"),
+        "timeframe": _text_or_empty(draft.get("timeframe"), 60),
+        "timeframe_days": draft.get("timeframe_days"),
+        "deadline": draft.get("deadline"),
+        "preference": _text_or_empty(draft.get("preference"), 100),
+        "goal_type": draft.get("goal_type"),
+        "tags": _normalize_text_list(draft.get("tags"))[:6],
+        "student_context": draft.get("student_context") if isinstance(draft.get("student_context"), dict) else {},
+        "time_constraints": draft.get("time_constraints") if isinstance(draft.get("time_constraints"), dict) else {},
+    }
+
+
+def _course_planner_payload(
+    *,
+    draft: Dict[str, Any],
+    estimate: Dict[str, Any],
+    profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    period_days = draft.get("timeframe_days") or estimate.get("estimated_days")
+    max_task_minutes = min(
+        180,
+        max(30, _coerce_positive_int(draft.get("daily_minutes"), 90, minimum=30, maximum=240)),
+    )
+    return {
+        "iface": "course_plan.v2",
+        "req": {
+            "n": _text_or_empty(draft.get("goal_name"), 60),
+            "use": _text_or_empty(draft.get("purpose"), 60),
+            "base": _text_or_empty(draft.get("current_level"), 50),
+            "target": _text_or_empty(draft.get("target_level"), 80),
+            "days": period_days,
+            "deadline": draft.get("deadline"),
+            "pref": _text_or_empty(draft.get("preference"), 50),
+            "type": _normalize_goal_type(draft.get("goal_type")) or "skill",
+            "tags": _normalize_text_list(draft.get("tags"))[:5],
+        },
+        "student": {
+            "major": _text_or_empty(profile.get("major"), 50),
+            "grade": _text_or_empty(profile.get("grade"), 30),
+            "career": _text_or_empty(profile.get("career_target"), 60),
+            "base": _text_or_empty(profile.get("baseline_level"), 50),
+            "weak": _text_or_empty(profile.get("weaknesses"), 80),
+            "strong": _text_or_empty(profile.get("strengths"), 80),
+            "courses": _normalize_text_list(profile.get("current_courses"))[:5],
+            "habit": _normalize_text_list(profile.get("learning_preferences"))[:3],
+            "weekday_min": profile.get("weekday_minutes"),
+            "weekend_min": profile.get("weekend_minutes"),
+            "time": _text_or_empty(profile.get("preferred_study_time"), 50),
+            "limit": _text_or_empty(profile.get("constraints"), 80),
+        },
+        "est": {
+            "h": estimate.get("estimated_hours"),
+            "days": estimate.get("estimated_days"),
+            "fit": estimate.get("fit"),
+        },
+        "limits": {
+            "phase_policy": "按目标范围、周期、总时长、基础和目标动态决定阶段数量，不固定阶段数。",
+            "task_policy": "每阶段只放必要任务，保持精简但不要漏掉关键阶段。",
+            "title_chars": 20,
+            "task_desc_chars": 36,
+            "plan_desc_chars": 28,
+            "max_task_minutes": max_task_minutes,
+            "json_only": True,
+        },
+    }
+
+
+def _course_plan_signature(
+    *,
+    draft: Dict[str, Any],
+    estimate: Dict[str, Any],
+    profile: Dict[str, Any],
+) -> str:
+    payload = {
+        "draft": _compact_requirement_draft_context(draft),
+        "estimate": estimate,
+        "profile": _compact_profile_context(profile),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _cached_course_plan_spec(signature: str) -> Optional[Dict[str, Any]]:
+    state = _load_schedule_state()
+    cache = state.get("course_plan_spec_cache")
+    if not isinstance(cache, dict):
+        return None
+
+    entry = cache.get(signature)
+    if not isinstance(entry, dict):
+        return None
+
+    updated_at = _parse_datetime(str(entry.get("updated_at") or ""))
+    if not updated_at:
+        return None
+
+    age = (_local_now() - updated_at.astimezone(_LOCAL_TIMEZONE)).total_seconds()
+    if age > _LEARNING_COURSE_PLAN_CACHE_TTL_SECONDS:
+        return None
+
+    plan_spec = entry.get("plan_spec")
+    return plan_spec if isinstance(plan_spec, dict) else None
+
+
+def _save_course_plan_spec_cache(signature: str, plan_spec: Dict[str, Any]) -> None:
+    if not _normalize_plan_spec(plan_spec):
+        return
+
+    state = _load_schedule_state()
+    cache = state.get("course_plan_spec_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+
+    cache[signature] = {
+        "plan_spec": plan_spec,
+        "updated_at": _local_now().isoformat(),
+    }
+
+    if len(cache) > 40:
+        ordered = sorted(
+            cache.items(),
+            key=lambda item: str(item[1].get("updated_at") if isinstance(item[1], dict) else ""),
+            reverse=True,
+        )
+        cache = dict(ordered[:40])
+
+    state["course_plan_spec_cache"] = cache
+    errors = state.get("course_plan_spec_errors")
+    if isinstance(errors, dict):
+        errors.pop(signature, None)
+        state["course_plan_spec_errors"] = errors
+    _save_schedule_state(state)
+
+
+def _cached_course_plan_spec_error(signature: str) -> Optional[str]:
+    state = _load_schedule_state()
+    errors = state.get("course_plan_spec_errors")
+    if not isinstance(errors, dict):
+        return None
+
+    entry = errors.get(signature)
+    if not isinstance(entry, dict):
+        return None
+
+    message = _text_or_empty(entry.get("message"), 300)
+    errors.pop(signature, None)
+    state["course_plan_spec_errors"] = errors
+    _save_schedule_state(state)
+    return message or None
+
+
+def _clear_course_plan_spec_error(signature: str) -> None:
+    state = _load_schedule_state()
+    errors = state.get("course_plan_spec_errors")
+    if not isinstance(errors, dict) or signature not in errors:
+        return
+
+    errors.pop(signature, None)
+    state["course_plan_spec_errors"] = errors
+    _save_schedule_state(state)
+
+
+def _save_course_plan_spec_error(signature: str, message: str) -> None:
+    state = _load_schedule_state()
+    errors = state.get("course_plan_spec_errors")
+    if not isinstance(errors, dict):
+        errors = {}
+
+    errors[signature] = {
+        "message": _text_or_empty(message, 500) or "模型没有返回可用的结构化结果。",
+        "updated_at": _local_now().isoformat(),
+    }
+    state["course_plan_spec_errors"] = errors
+    _save_schedule_state(state)
+
+
+def _store_course_plan_inflight_result(signature: str, task: asyncio.Task) -> None:
+    try:
+        result = task.result()
+    except asyncio.CancelledError:
+        _COURSE_PLAN_INFLIGHT.pop(signature, None)
+        return
+    except Exception as exc:
+        _save_course_plan_spec_error(signature, str(exc))
+        _COURSE_PLAN_INFLIGHT.pop(signature, None)
+        return
+
+    if isinstance(result, dict) and _normalize_plan_spec(result):
+        _save_course_plan_spec_cache(signature, result)
+    else:
+        _save_course_plan_spec_error(signature, "模型没有返回可用的结构化计划。")
+    _COURSE_PLAN_INFLIGHT.pop(signature, None)
+
+
+def _task_guidance_signature(
+    *,
+    task: Dict[str, Any],
+    goal: Optional[Dict[str, Any]],
+    plan: Optional[Dict[str, Any]],
+    profile: Dict[str, Any],
+    recent_feedback: List[Dict[str, Any]],
+) -> str:
+    payload = {
+        "task": {
+            **_compact_task_context(task),
+            "id": task.get("id"),
+            "updated_at": task.get("updated_at"),
+        },
+        "goal": _compact_goal_context(goal),
+        "plan": _compact_plan_context(plan),
+        "profile": _compact_profile_context(profile),
+        "recent_goal_feedback": _compact_recent_feedback(recent_feedback),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _cached_task_guidance(task_id: str, signature: str) -> Optional[Dict[str, Any]]:
+    state = _load_schedule_state()
+    cache = state.get("task_guidance_cache")
+    if not isinstance(cache, dict):
+        return None
+
+    entry = cache.get(task_id)
+    if not isinstance(entry, dict) or entry.get("signature") != signature:
+        return None
+
+    updated_at = _parse_datetime(str(entry.get("updated_at") or ""))
+    if not updated_at:
+        return None
+
+    age = (_local_now() - updated_at.astimezone(_LOCAL_TIMEZONE)).total_seconds()
+    if age > _LEARNING_TASK_GUIDANCE_CACHE_TTL_SECONDS:
+        return None
+
+    guidance = entry.get("guidance")
+    return guidance if isinstance(guidance, dict) else None
+
+
+def _save_task_guidance_cache(task_id: str, signature: str, guidance: Dict[str, Any]) -> None:
+    state = _load_schedule_state()
+    cache = state.get("task_guidance_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+
+    cache[task_id] = {
+        "signature": signature,
+        "guidance": guidance,
+        "updated_at": _local_now().isoformat(),
+    }
+
+    if len(cache) > 80:
+        ordered = sorted(
+            cache.items(),
+            key=lambda item: str(item[1].get("updated_at") if isinstance(item[1], dict) else ""),
+            reverse=True,
+        )
+        cache = dict(ordered[:80])
+
+    state["task_guidance_cache"] = cache
+    errors = state.get("task_guidance_errors")
+    if isinstance(errors, dict):
+        errors.pop(f"{task_id}:{signature}", None)
+        state["task_guidance_errors"] = errors
+    _save_schedule_state(state)
+
+
+def _task_guidance_error_key(task_id: str, signature: str) -> str:
+    return f"{task_id}:{signature}" if task_id else signature
+
+
+def _cached_task_guidance_error(task_id: str, signature: str) -> Optional[str]:
+    state = _load_schedule_state()
+    errors = state.get("task_guidance_errors")
+    if not isinstance(errors, dict):
+        return None
+
+    entry = errors.get(_task_guidance_error_key(task_id, signature))
+    if not isinstance(entry, dict):
+        return None
+
+    return _text_or_empty(entry.get("message"), 300) or None
+
+
+def _clear_task_guidance_error(task_id: str, signature: str) -> None:
+    state = _load_schedule_state()
+    errors = state.get("task_guidance_errors")
+    key = _task_guidance_error_key(task_id, signature)
+    if not isinstance(errors, dict) or key not in errors:
+        return
+
+    errors.pop(key, None)
+    state["task_guidance_errors"] = errors
+    _save_schedule_state(state)
+
+
+def _save_task_guidance_error(task_id: str, signature: str, message: str) -> None:
+    state = _load_schedule_state()
+    errors = state.get("task_guidance_errors")
+    if not isinstance(errors, dict):
+        errors = {}
+
+    errors[_task_guidance_error_key(task_id, signature)] = {
+        "message": _text_or_empty(message, 500) or "模型没有返回可用的任务建议。",
+        "updated_at": _local_now().isoformat(),
+    }
+    state["task_guidance_errors"] = errors
+    _save_schedule_state(state)
+
+
+def _store_task_guidance_inflight_result(task_id: str, signature: str, task: asyncio.Task) -> None:
+    try:
+        parsed = task.result()
+    except asyncio.CancelledError:
+        _TASK_GUIDANCE_INFLIGHT.pop(_task_guidance_error_key(task_id, signature), None)
+        return
+    except Exception as exc:
+        _save_task_guidance_error(task_id, signature, str(exc))
+        _TASK_GUIDANCE_INFLIGHT.pop(_task_guidance_error_key(task_id, signature), None)
+        return
+
+    guidance = _normalize_task_guidance_payload(parsed)
+    if guidance:
+        guidance["updated_at"] = datetime.now(timezone.utc).isoformat()
+        if task_id:
+            _save_task_guidance_cache(task_id, signature, guidance)
+    else:
+        _save_task_guidance_error(task_id, signature, "模型没有返回可用的结构化任务建议。")
+    _TASK_GUIDANCE_INFLIGHT.pop(_task_guidance_error_key(task_id, signature), None)
+
+
+def _today_timetable_signature(
+    today: date,
+    tasks: List[Dict[str, Any]],
+    goals: Dict[str, Dict[str, Any]],
+    profile: Dict[str, Any],
+) -> str:
+    payload = {
+        "today": today.isoformat(),
+        "tasks": [
+            {
+                "id": task.get("id"),
+                "goal_id": task.get("goal_id"),
+                "title": task.get("title"),
+                "description": task.get("description"),
+                "estimated_minutes": task.get("estimated_minutes"),
+                "status": task.get("status"),
+                "updated_at": task.get("updated_at"),
+                "learning_feedback": task.get("learning_feedback"),
+            }
+            for task in tasks
+        ],
+        "goals": {
+            goal_id: {
+                "name": goal.get("name"),
+                "target_date": goal.get("target_date"),
+                "progress": goal.get("progress"),
+                "last_learning_feedback": goal.get("last_learning_feedback"),
+            }
+            for goal_id, goal in sorted(goals.items())
+            if any(task.get("goal_id") == goal_id for task in tasks)
+        },
+        "profile": {
+            "major": profile.get("major"),
+            "grade": profile.get("grade"),
+            "baseline_level": profile.get("baseline_level"),
+            "weekday_minutes": profile.get("weekday_minutes"),
+            "weekend_minutes": profile.get("weekend_minutes"),
+            "preferred_study_time": profile.get("preferred_study_time"),
+            "learning_preferences": profile.get("learning_preferences"),
+            "constraints": profile.get("constraints"),
+            "weaknesses": profile.get("weaknesses"),
+        },
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _task_timetable_duration(task: Dict[str, Any]) -> int:
+    return _coerce_positive_int(task.get("estimated_minutes"), 30, minimum=15, maximum=8 * 60)
+
+
+def _snap_timetable_minute(minutes: int) -> int:
+    return int(round(minutes / 15) * 15)
+
+
+def _preferred_timetable_start(profile: Dict[str, Any], total_minutes: int) -> int:
+    preference = str(profile.get("preferred_study_time") or "")
+    if any(marker in preference for marker in ("晚", "夜")):
+        preferred = 19 * 60
+    elif any(marker in preference for marker in ("下午", "午后")):
+        preferred = 14 * 60
+    elif "中午" in preference:
+        preferred = 12 * 60
+    elif any(marker in preference for marker in ("早", "上午")):
+        preferred = 8 * 60
+    else:
+        preferred = 9 * 60
+
+    latest_start = max(8 * 60, 22 * 60 - total_minutes)
+    return max(8 * 60, min(latest_start, _snap_timetable_minute(preferred)))
+
+
+def _local_today_timetable_entries(
+    tasks: List[Dict[str, Any]],
+    profile: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if not tasks:
+        return []
+
+    durations = [_task_timetable_duration(task) for task in tasks]
+    day_minutes = 14 * 60
+    total_duration = sum(durations)
+    available_gap = max(0, day_minutes - total_duration)
+    if len(tasks) <= 1 or available_gap <= 0:
+        gap = 0
+    else:
+        minimum_gap = 10 if available_gap >= 10 * (len(tasks) - 1) else 0
+        extra_gap = max(0, available_gap - minimum_gap * (len(tasks) - 1))
+        gap = minimum_gap + min(45, extra_gap // max(1, len(tasks) - 1))
+
+    total_block = min(day_minutes, total_duration + gap * max(0, len(tasks) - 1))
+    cursor = _preferred_timetable_start(profile, total_block)
+    entries: List[Dict[str, Any]] = []
+
+    for task, duration in zip(tasks, durations):
+        latest_start = max(8 * 60, 22 * 60 - duration)
+        start_minutes = max(8 * 60, min(latest_start, _snap_timetable_minute(cursor)))
+        entries.append(
+            {
+                "task_id": str(task.get("id") or ""),
+                "start_time": _clock_label(start_minutes),
+                "end_time": _clock_label(start_minutes + duration),
+                "reason": "本地快速排布：按今日任务顺序安排。",
+            }
+        )
+        cursor = start_minutes + duration + gap
+
+    return entries
+
+
+def _normalize_today_timetable_payload(
+    payload: Dict[str, Any],
+    tasks: List[Dict[str, Any]],
+) -> Optional[List[Dict[str, Any]]]:
+    if not isinstance(payload, dict):
+        return None
+
+    raw_entries = payload.get("timetable") or payload.get("schedule") or payload.get("items")
+    if not isinstance(raw_entries, list):
+        return None
+
+    task_by_id = {str(task.get("id")): task for task in tasks if task.get("id")}
+    task_by_slot = {
+        str(index): task
+        for index, task in enumerate(tasks, start=1)
+        if task.get("id")
+    }
+    task_order = {
+        str(task.get("id")): index
+        for index, task in enumerate(tasks)
+        if task.get("id")
+    }
+    entries: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            continue
+        task_id = str(raw_entry.get("task_id") or raw_entry.get("id") or "").strip()
+        task = task_by_id.get(task_id)
+        if not task:
+            for slot_key in ("slot", "no", "index", "order", "task_no", "task_number", "number"):
+                slot_text = str(raw_entry.get(slot_key) or "").strip()
+                slot_match = re.search(r"\d+", slot_text)
+                if not slot_match:
+                    continue
+                task = task_by_slot.get(slot_match.group(0))
+                if task:
+                    task_id = str(task.get("id") or "")
+                    break
+        if not task or task_id in seen:
+            continue
+        start_minutes = _clock_minutes(
+            raw_entry.get("start_time")
+            or raw_entry.get("start")
+            or raw_entry.get("begin_time")
+            or raw_entry.get("time")
+        )
+        if start_minutes is None:
+            continue
+        duration = _task_timetable_duration(task)
+        latest_start = max(8 * 60, 22 * 60 - duration)
+        start_minutes = max(8 * 60, min(latest_start, start_minutes))
+        entries.append(
+            {
+                "task_id": task_id,
+                "start_minutes": start_minutes,
+                "duration_minutes": duration,
+                "reason": _text_or_empty(raw_entry.get("reason"), 180),
+            }
+        )
+        seen.add(task_id)
+
+    if len(entries) != len(task_by_id):
+        return None
+
+    entries.sort(key=lambda entry: task_order.get(str(entry.get("task_id") or ""), 100_000))
+    cursor = 8 * 60
+    normalized: List[Dict[str, Any]] = []
+    for entry in entries:
+        start_minutes = max(cursor, entry["start_minutes"])
+        duration = entry["duration_minutes"]
+        if start_minutes + duration > 22 * 60:
+            return None
+        normalized.append(
+            {
+                "task_id": entry["task_id"],
+                "start_time": _clock_label(start_minutes),
+                "end_time": _clock_label(start_minutes + duration),
+                "reason": entry["reason"],
+            }
+        )
+        cursor = start_minutes + duration + 10
+
+    return normalized
+
+
+def _save_today_timetable_entries(
+    *,
+    today: date,
+    signature: str,
+    entries: List[Dict[str, Any]],
+) -> None:
+    state = _load_schedule_state()
+    state["today_timetable"] = {
+        "date": today.isoformat(),
+        "signature": signature,
+        "entries": entries,
+        "updated_at": _local_now().isoformat(),
+    }
+    state.pop("today_timetable_error", None)
+    _save_schedule_state(state)
+
+
+def _save_today_timetable_error(
+    *,
+    today: date,
+    signature: str,
+    skill: str,
+    message: str,
+) -> None:
+    state = _load_schedule_state()
+    state["today_timetable_error"] = {
+        "date": today.isoformat(),
+        "signature": signature,
+        "skill": skill,
+        "message": _text_or_empty(message, 500) or "模型没有返回可用的今日排课。",
+        "updated_at": _local_now().isoformat(),
+    }
+    _save_schedule_state(state)
+
+
+def _store_today_timetable_inflight_result(
+    signature: str,
+    today: date,
+    tasks: List[Dict[str, Any]],
+    task: asyncio.Task,
+) -> None:
+    try:
+        result = task.result()
+    except asyncio.CancelledError:
+        _TODAY_TIMETABLE_INFLIGHT.pop(signature, None)
+        return
+    except LearningSkillError as exc:
+        _save_today_timetable_error(
+            today=today,
+            signature=signature,
+            skill=exc.skill_name,
+            message=str(exc),
+        )
+        _TODAY_TIMETABLE_INFLIGHT.pop(signature, None)
+        return
+    except Exception as exc:
+        _save_today_timetable_error(
+            today=today,
+            signature=signature,
+            skill="daily-scheduler",
+            message=str(exc),
+        )
+        _TODAY_TIMETABLE_INFLIGHT.pop(signature, None)
+        return
+
+    entries = _normalize_today_timetable_payload(result, tasks)
+    if entries:
+        _save_today_timetable_entries(
+            today=today,
+            signature=signature,
+            entries=entries,
+        )
+    else:
+        _save_today_timetable_error(
+            today=today,
+            signature=signature,
+            skill="daily-scheduler",
+            message="daily-scheduler returned an incomplete or invalid timetable",
+        )
+    _TODAY_TIMETABLE_INFLIGHT.pop(signature, None)
+
+
+async def _generate_today_timetable_with_llm(
+    *,
+    all_tasks: Dict[str, Dict[str, Any]],
+    today: date,
+    tasks: List[Dict[str, Any]],
+    goals: Dict[str, Dict[str, Any]],
+    profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    payload = {
+        "today": today.isoformat(),
+        "contract": "只为今天给定 slot 安排开始时间；不要反问，不做周计划，只返回 JSON。",
+        "day_window": "08:00-22:00",
+        "student": {
+            "major": _text_or_empty(profile.get("major"), 60),
+            "grade": _text_or_empty(profile.get("grade"), 60),
+            "baseline_level": _text_or_empty(profile.get("baseline_level"), 80),
+            "weekday_minutes": profile.get("weekday_minutes"),
+            "weekend_minutes": profile.get("weekend_minutes"),
+            "preferred_study_time": _text_or_empty(profile.get("preferred_study_time"), 80),
+            "learning_preferences": _normalize_text_list(profile.get("learning_preferences"))[:3],
+            "weaknesses": _text_or_empty(profile.get("weaknesses"), 120),
+            "constraints": _text_or_empty(profile.get("constraints"), 120),
+        },
+        "rules": [
+            "只给今天已经选入容量的任务安排开始时间，不新增任务。",
+            "每个 slot 必须出现且只能出现一次；slot 是今天左侧任务编号。",
+            "优先返回 slot，task_id 只作为辅助识别。",
+            "开始时间要贴合 preferred_study_time、constraints、课程难度和任务时长。",
+            "任务之间至少留 10 分钟缓冲，不能超出 08:00-22:00。",
+        ],
+        "output_schema": {"timetable": [{"slot": 1, "start_time": "HH:MM", "reason": "30字内"}]},
+        "tasks": [
+            {
+                "slot": index,
+                "task_id": task.get("id"),
+                "title": _text_or_empty(task.get("title"), 80),
+                "minutes": _task_timetable_duration(task),
+                "difficulty": task.get("difficulty"),
+                "goal": _text_or_empty(
+                    (goals.get(str(task.get("goal_id") or "")) or {}).get("name"),
+                    80,
+                ),
+                "target_date": (goals.get(str(task.get("goal_id") or "")) or {}).get("target_date"),
+            }
+            for index, task in enumerate(tasks, start=1)
+        ],
+    }
+    parsed = await asyncio.to_thread(
+        _invoke_learning_llm_json_for_thread,
+        system_message=_learning_skill_system_message("daily-scheduler"),
+        payload=payload,
+        label="daily-scheduler",
+        max_tokens=_LEARNING_TIMETABLE_MAX_OUTPUT_TOKENS,
+    )
+    if not parsed:
+        raise LearningSkillError(
+            "daily-scheduler",
+            "daily-scheduler did not return a valid JSON object",
+        )
+    return parsed
+
+
+async def _today_timetable_entries(
+    *,
+    all_tasks: Dict[str, Dict[str, Any]],
+    today: date,
+    tasks: List[Dict[str, Any]],
+    goals: Dict[str, Dict[str, Any]],
+    profile: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if not tasks:
+        return []
+
+    signature = _today_timetable_signature(today, tasks, goals, profile)
+    state = _load_schedule_state()
+    cached = state.get("today_timetable")
+    if (
+        isinstance(cached, dict)
+        and cached.get("date") == today.isoformat()
+        and cached.get("signature") == signature
+        and isinstance(cached.get("entries"), list)
+    ):
+        return cached["entries"]
+
+    cached_error = state.get("today_timetable_error")
+    if (
+        isinstance(cached_error, dict)
+        and cached_error.get("date") == today.isoformat()
+        and cached_error.get("signature") == signature
+    ):
+        state.pop("today_timetable_error", None)
+        _save_schedule_state(state)
+        raise LearningSkillError(
+            str(cached_error.get("skill") or "daily-scheduler"),
+            _text_or_empty(cached_error.get("message"), 500)
+            or "daily-scheduler returned an incomplete or invalid timetable",
+        )
+
+    running = _TODAY_TIMETABLE_INFLIGHT.get(signature)
+    if running is None:
+        running = asyncio.create_task(
+            _generate_today_timetable_with_llm(
+                all_tasks=all_tasks,
+                today=today,
+                tasks=tasks,
+                goals=goals,
+                profile=profile,
+            )
+        )
+        _TODAY_TIMETABLE_INFLIGHT[signature] = running
+        running.add_done_callback(
+            lambda completed, timetable_signature=signature, timetable_today=today, timetable_tasks=[
+                dict(task) for task in tasks
+            ]: _store_today_timetable_inflight_result(
+                timetable_signature,
+                timetable_today,
+                timetable_tasks,
+                completed,
+            )
+        )
+
+    if not running.done():
+        raise LearningSkillPendingError("daily-scheduler")
+
+    try:
+        parsed = await running
+    except LearningSkillError as exc:
+        state["today_timetable_error"] = {
+            "date": today.isoformat(),
+            "signature": signature,
+            "skill": exc.skill_name,
+            "message": str(exc),
+            "updated_at": _local_now().isoformat(),
+        }
+        _save_schedule_state(state)
+        raise
+
+    entries = _normalize_today_timetable_payload(parsed, tasks)
+    if not entries:
+        _log.warning(
+            "daily-scheduler returned invalid timetable payload: %s",
+            json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))[:800],
+        )
+        exc = LearningSkillError(
+            "daily-scheduler",
+            "daily-scheduler returned an incomplete or invalid timetable",
+        )
+        state["today_timetable_error"] = {
+            "date": today.isoformat(),
+            "signature": signature,
+            "skill": exc.skill_name,
+            "message": str(exc),
+            "updated_at": _local_now().isoformat(),
+        }
+        _save_schedule_state(state)
+        raise exc
+
+    _save_today_timetable_entries(
+        today=today,
+        signature=signature,
+        entries=entries,
+    )
+    return entries
+
+
+def _guidance_list(value: Any, *, limit: int = 5, item_limit: int = 180) -> List[str]:
+    if isinstance(value, str):
+        raw_items = [
+            item.strip()
+            for item in re.split(r"[;；\n]", value)
+            if item.strip()
+        ]
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = []
+
+    items: List[str] = []
+    for item in raw_items:
+        text = _text_or_empty(item, item_limit)
+        if text and text not in items:
+            items.append(text)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _normalize_task_guidance_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+
+    data = payload.get("guidance") if isinstance(payload.get("guidance"), dict) else payload
+    if not isinstance(data, dict):
+        return None
+
+    summary = _text_or_empty(data.get("summary"), 120)
+    steps = _guidance_list(data.get("steps"), limit=3, item_limit=100)
+    focus_points = _guidance_list(data.get("focus_points"), limit=2, item_limit=80)
+    pitfalls = _guidance_list(data.get("pitfalls"), limit=2, item_limit=80)
+    checklist = _guidance_list(data.get("checklist"), limit=2, item_limit=80)
+
+    if not summary or len(steps) < 2 or not focus_points or not pitfalls or not checklist:
+        return None
+
+    return {
+        "summary": summary,
+        "steps": steps,
+        "focus_points": focus_points,
+        "pitfalls": pitfalls,
+        "checklist": checklist,
+    }
+
+
+def _normalize_progress_feedback_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+
+    data = payload.get("feedback_analysis") if isinstance(payload.get("feedback_analysis"), dict) else payload
+    if not isinstance(data, dict):
+        return None
+
+    mastery_signal = _text_or_empty(data.get("mastery_signal"), 24).lower()
+    if mastery_signal not in {"strong", "ok", "weak"}:
+        mastery_signal = "ok"
+
+    pace_signal = _text_or_empty(data.get("pace_signal"), 24).lower()
+    if pace_signal not in {"ahead", "on_track", "behind"}:
+        pace_signal = "on_track"
+
+    risk_level = _text_or_empty(data.get("risk_level"), 24).lower()
+    if risk_level not in {"low", "medium", "high"}:
+        risk_level = "medium" if mastery_signal == "weak" else "low"
+
+    follow_up_raw = data.get("follow_up_task") if isinstance(data.get("follow_up_task"), dict) else {}
+    follow_up_needed = bool(follow_up_raw.get("needed"))
+    follow_up_title = _text_or_empty(follow_up_raw.get("title"), 120)
+    follow_up_description = _text_or_empty(follow_up_raw.get("description"), 500)
+
+    follow_up_task = {
+        "needed": follow_up_needed and bool(follow_up_title),
+        "title": follow_up_title,
+        "description": follow_up_description,
+        "estimated_minutes": _coerce_positive_int(
+            follow_up_raw.get("estimated_minutes"),
+            45,
+            minimum=15,
+            maximum=180,
+        ),
+        "priority": _coerce_positive_int(
+            follow_up_raw.get("priority"),
+            1,
+            minimum=1,
+            maximum=5,
+        ),
+    }
+
+    return {
+        "summary": _text_or_empty(data.get("summary"), 300),
+        "mastery_signal": mastery_signal,
+        "pace_signal": pace_signal,
+        "risk_level": risk_level,
+        "schedule_hint": _text_or_empty(data.get("schedule_hint"), 240),
+        "next_guidance_focus": _guidance_list(data.get("next_guidance_focus"), limit=4),
+        "duration_multiplier": _coerce_positive_float(
+            data.get("duration_multiplier"),
+            1.0,
+            minimum=0.75,
+            maximum=1.5,
+        ),
+        "follow_up_task": follow_up_task,
+    }
+
+
+async def _generate_progress_feedback_with_llm(
+    *,
+    task: Dict[str, Any],
+    goal: Optional[Dict[str, Any]],
+    plan: Optional[Dict[str, Any]],
+    profile: Dict[str, Any],
+    feedback: Dict[str, Any],
+    recent_feedback: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    payload = {
+        "today": _local_today().isoformat(),
+        "task": {
+            "id": task.get("id"),
+            "title": task.get("title"),
+            "description": task.get("description"),
+            "difficulty": task.get("difficulty"),
+            "estimated_minutes": task.get("estimated_minutes"),
+            "scheduled_date": task.get("scheduled_date"),
+        },
+        "goal": goal or {},
+        "plan": plan or {},
+        "student_profile": _profile_with_status(profile),
+        "completion_feedback": feedback,
+        "recent_goal_feedback": recent_feedback,
+    }
+    return await _call_learning_llm_json_async(
+        system_message=_learning_skill_system_message("progress-feedback"),
+        payload=payload,
+        label="progress-feedback",
+        timeout_seconds=_LEARNING_PROGRESS_FEEDBACK_LLM_TIMEOUT_SECONDS,
+        required=True,
+        max_tokens=_LEARNING_PROGRESS_FEEDBACK_MAX_OUTPUT_TOKENS,
+    )
+
+
+def _create_feedback_follow_up_task(
+    *,
+    tasks: Dict[str, Dict[str, Any]],
+    plans: Dict[str, Dict[str, Any]],
+    source_task: Dict[str, Any],
+    analysis: Dict[str, Any],
+    now: datetime,
+) -> Optional[Dict[str, Any]]:
+    follow_up = analysis.get("follow_up_task")
+    if not isinstance(follow_up, dict) or not follow_up.get("needed"):
+        return None
+
+    title = _text_or_empty(follow_up.get("title"), 120)
+    if not title:
+        return None
+
+    plan_id = str(source_task.get("plan_id") or "")
+    goal_id = str(source_task.get("goal_id") or "")
+    sibling_positions = [
+        _coerce_positive_int(task.get("position"), 0, minimum=0, maximum=100_000)
+        for task in tasks.values()
+        if str(task.get("plan_id") or "") == plan_id
+    ]
+    position = (max(sibling_positions) + 1) if sibling_positions else 0
+    task_id = _generate_id()
+    new_task = {
+        "id": task_id,
+        "plan_id": plan_id,
+        "goal_id": goal_id,
+        "title": title,
+        "description": _text_or_empty(follow_up.get("description"), 500)
+        or _text_or_empty(analysis.get("schedule_hint"), 240),
+        "status": TaskStatus.PENDING.value,
+        "difficulty": "medium",
+        "estimated_minutes": _coerce_positive_int(
+            follow_up.get("estimated_minutes"),
+            45,
+            minimum=15,
+            maximum=180,
+        ),
+        "scheduled_date": "",
+        "completed_at": None,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+        "position": position,
+        "priority": _coerce_positive_int(
+            follow_up.get("priority"),
+            1,
+            minimum=1,
+            maximum=5,
+        ),
+        "source": "progress-feedback",
+        "feedback_source_task_id": source_task.get("id"),
+    }
+    tasks[task_id] = new_task
+
+    if plan_id in plans:
+        plans[plan_id]["total_tasks"] = _coerce_positive_int(
+            plans[plan_id].get("total_tasks"),
+            0,
+            minimum=0,
+            maximum=100_000,
+        ) + 1
+        plans[plan_id]["updated_at"] = now.isoformat()
+
+    return new_task
+
+
+def _adjust_pending_tasks_from_feedback(
+    *,
+    tasks: Dict[str, Dict[str, Any]],
+    source_task: Dict[str, Any],
+    analysis: Dict[str, Any],
+    now: datetime,
+) -> None:
+    multiplier = _coerce_positive_float(
+        analysis.get("duration_multiplier"),
+        1.0,
+        minimum=0.75,
+        maximum=1.5,
+    )
+    if abs(multiplier - 1.0) < 0.05:
+        return
+
+    goal_id = str(source_task.get("goal_id") or "")
+    pending = [
+        task
+        for task in tasks.values()
+        if str(task.get("goal_id") or "") == goal_id
+        and task.get("status") == TaskStatus.PENDING.value
+        and task.get("id") != source_task.get("id")
+    ]
+    pending.sort(
+        key=lambda task: (
+            str(task.get("scheduled_date") or ""),
+            _coerce_positive_int(task.get("priority"), 3, minimum=1, maximum=5),
+            _coerce_positive_int(task.get("position"), 0, minimum=0, maximum=100_000),
+        )
+    )
+
+    for task in pending[:2]:
+        original = _coerce_positive_int(
+            task.get("estimated_minutes"),
+            45,
+            minimum=15,
+            maximum=240,
+        )
+        adjusted = int(round(original * multiplier / 5) * 5)
+        task["estimated_minutes"] = max(15, min(240, adjusted))
+        task["adjusted_by_feedback"] = source_task.get("id")
+        task["updated_at"] = now.isoformat()
+
+
+async def _analyze_and_apply_task_feedback(
+    *,
+    tasks: Dict[str, Dict[str, Any]],
+    plans: Dict[str, Dict[str, Any]],
+    goals: Dict[str, Dict[str, Any]],
+    task_id: str,
+    profile: Dict[str, Any],
+    feedback: Dict[str, Any],
+    now: datetime,
+) -> Dict[str, Any]:
+    task = tasks[task_id]
+    goal_id = str(task.get("goal_id") or "")
+    plan_id = str(task.get("plan_id") or "")
+    raw_feedback = {
+        **feedback,
+        "submitted_at": now.isoformat(),
+        "analysis_status": "pending",
+    }
+    task["learning_feedback"] = raw_feedback
+
+    try:
+        parsed = await _generate_progress_feedback_with_llm(
+            task=task,
+            goal=goals.get(goal_id),
+            plan=plans.get(plan_id),
+            profile=profile,
+            feedback=feedback,
+            recent_feedback=_recent_feedback_for_goal(goal_id, tasks),
+        )
+        analysis = _normalize_progress_feedback_payload(parsed)
+        if not analysis:
+            raise LearningSkillError(
+                "progress-feedback",
+                "progress-feedback returned incomplete analysis",
+            )
+    except LearningSkillError as exc:
+        raw_feedback["analysis_status"] = "failed"
+        raw_feedback["analysis_error"] = str(exc)
+        return raw_feedback
+
+    raw_feedback["analysis_status"] = "ready"
+    raw_feedback["analysis"] = analysis
+    task["learning_feedback"] = raw_feedback
+
+    if goal_id in goals:
+        goals[goal_id]["last_learning_feedback"] = {
+            "task_id": task_id,
+            "task_title": task.get("title"),
+            "summary": analysis.get("summary"),
+            "mastery_signal": analysis.get("mastery_signal"),
+            "pace_signal": analysis.get("pace_signal"),
+            "risk_level": analysis.get("risk_level"),
+            "schedule_hint": analysis.get("schedule_hint"),
+            "updated_at": now.isoformat(),
+        }
+        goals[goal_id]["updated_at"] = now.isoformat()
+
+    _create_feedback_follow_up_task(
+        tasks=tasks,
+        plans=plans,
+        source_task=task,
+        analysis=analysis,
+        now=now,
+    )
+    _adjust_pending_tasks_from_feedback(
+        tasks=tasks,
+        source_task=task,
+        analysis=analysis,
+        now=now,
+    )
+    return raw_feedback
+
+
+async def _generate_task_guidance_with_llm(
+    *,
+    task: Dict[str, Any],
+    goal: Optional[Dict[str, Any]],
+    plan: Optional[Dict[str, Any]],
+    profile: Dict[str, Any],
+    recent_feedback: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    system_message = _learning_skill_system_message("task-guidance")
+    payload = {
+        "today": _local_today().isoformat(),
+        "task": _compact_task_context(task),
+        "goal": _compact_goal_context(goal),
+        "plan": _compact_plan_context(plan),
+        "student_profile": _compact_profile_context(profile),
+        "recent_goal_feedback": _compact_recent_feedback(recent_feedback),
+    }
+    return await _call_learning_llm_json_async(
+        system_message=system_message,
+        payload=payload,
+        label="task-guidance",
+        timeout_seconds=None,
+        required=True,
+        max_tokens=_LEARNING_TASK_GUIDANCE_MAX_OUTPUT_TOKENS,
+    )
+
+
+async def _build_task_guidance_response(
+    *,
+    task: Dict[str, Any],
+    goal: Optional[Dict[str, Any]],
+    plan: Optional[Dict[str, Any]],
+    profile: Dict[str, Any],
+    recent_feedback: Optional[List[Dict[str, Any]]] = None,
+    force_retry: bool = False,
+) -> Dict[str, Any]:
+    task_id = str(task.get("id") or "")
+    signature = _task_guidance_signature(
+        task=task,
+        goal=goal,
+        plan=plan,
+        profile=profile,
+        recent_feedback=recent_feedback or [],
+    )
+    if force_retry:
+        _clear_task_guidance_error(task_id, signature)
+
+    cached_guidance = _cached_task_guidance(task_id, signature) if task_id else None
+    if cached_guidance and not force_retry:
+        return {
+            "task_id": task.get("id"),
+            "status": "ready",
+            "generated_by": "learning-skill-cache",
+            "skill": "task-guidance",
+            "updated_at": cached_guidance.get("updated_at") or datetime.now(timezone.utc).isoformat(),
+            **cached_guidance,
+        }
+
+    cached_error = None if force_retry else _cached_task_guidance_error(task_id, signature)
+    if cached_error:
+        return {
+            "task_id": task.get("id"),
+            "status": "failed",
+            "generated_by": "learning-skill-failed",
+            "skill": "task-guidance",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "error": cached_error,
+            "summary": "",
+            "steps": [],
+            "focus_points": [],
+            "pitfalls": [],
+            "checklist": [],
+        }
+
+    cache_key = _task_guidance_error_key(task_id, signature)
+    running = _TASK_GUIDANCE_INFLIGHT.get(cache_key)
+    if running is None:
+        running = asyncio.create_task(
+            _generate_task_guidance_with_llm(
+                task=task,
+                goal=goal,
+                plan=plan,
+                profile=profile,
+                recent_feedback=recent_feedback or [],
+            )
+        )
+        _TASK_GUIDANCE_INFLIGHT[cache_key] = running
+        running.add_done_callback(
+            lambda completed, guidance_task_id=task_id, guidance_signature=signature: _store_task_guidance_inflight_result(
+                guidance_task_id,
+                guidance_signature,
+                completed,
+            )
+        )
+
+    if not running.done():
+        return {
+            "task_id": task.get("id"),
+            "status": "generating",
+            "generated_by": "learning-skill-pending",
+            "skill": "task-guidance",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "summary": "",
+            "steps": [],
+            "focus_points": [],
+            "pitfalls": [],
+            "checklist": [],
+        }
+
+    try:
+        parsed = await running
+    except LearningSkillError as exc:
+        _save_task_guidance_error(task_id, signature, str(exc))
+        raise _learning_skill_http_exception(exc) from exc
+
+    guidance = _normalize_task_guidance_payload(parsed)
+    if not guidance:
+        message = "模型没有返回可用的结构化任务建议。"
+        _save_task_guidance_error(task_id, signature, message)
+        return {
+            "task_id": task.get("id"),
+            "status": "failed",
+            "generated_by": "learning-skill-failed",
+            "skill": "task-guidance",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "error": message,
+            "summary": "",
+            "steps": [],
+            "focus_points": [],
+            "pitfalls": [],
+            "checklist": [],
+        }
+
+    guidance["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if task_id:
+        _save_task_guidance_cache(task_id, signature, guidance)
+    _TASK_GUIDANCE_INFLIGHT.pop(cache_key, None)
+
+    return {
+        "task_id": task.get("id"),
+        "status": "ready",
+        "generated_by": "learning-skill",
+        "skill": "task-guidance",
+        "updated_at": guidance["updated_at"],
+        **guidance,
+    }
+
+
+def _first_value(source: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = source.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _first_list_value(source: Dict[str, Any], *keys: str) -> List[Any]:
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _duration_minutes_value(value: Any, default: int) -> int:
+    if isinstance(value, str):
+        text = value.strip().lower()
+        number = _number_from_text(text)
+        if number is not None:
+            if any(unit in text for unit in ["小时", "小時", "hour", "hr", "h"]):
+                return _coerce_positive_int(number * 60, default, minimum=10, maximum=240)
+            return _coerce_positive_int(number, default, minimum=10, maximum=240)
+    return _coerce_positive_int(value, default, minimum=10, maximum=240)
+
+
+def _raw_plan_list(plan_spec: Dict[str, Any]) -> List[Any]:
+    raw_plans = _first_value(
+        plan_spec,
+        "plans",
+        "p",
+        "phases",
+        "phase",
+        "stages",
+        "modules",
+        "sections",
+        "units",
+    )
+    if isinstance(raw_plans, dict):
+        nested = _raw_plan_list(raw_plans)
+        if nested:
+            return nested
+    if isinstance(raw_plans, list):
+        return raw_plans
+
+    raw_plan = plan_spec.get("plan")
+    if isinstance(raw_plan, list):
+        return raw_plan
+    if isinstance(raw_plan, dict):
+        nested = _raw_plan_list(raw_plan)
+        return nested or [raw_plan]
+
+    raw_tasks = _first_list_value(
+        plan_spec,
+        "tasks",
+        "t",
+        "items",
+        "lessons",
+        "steps",
+        "activities",
+        "topics",
+    )
+    if raw_tasks:
+        return [
+            {
+                "n": _text_or_empty(
+                    _first_value(plan_spec, "name", "n", "title", "phase", "module"),
+                    120,
+                )
+                or "学习任务",
+                "d": _text_or_empty(
+                    _first_value(plan_spec, "description", "d", "summary", "objective"),
+                    200,
+                ),
+                "t": raw_tasks,
+            }
+        ]
+    return []
+
+
+def _raw_task_list(raw_plan: Dict[str, Any]) -> List[Any]:
+    raw_tasks = _first_list_value(
+        raw_plan,
+        "tasks",
+        "t",
+        "items",
+        "lessons",
+        "steps",
+        "activities",
+        "topics",
+    )
+    if raw_tasks:
+        return raw_tasks
+
+    raw_task = raw_plan.get("task")
+    if isinstance(raw_task, list):
+        return raw_task
+    if isinstance(raw_task, dict):
+        return [raw_task]
+    return []
+
+
+def _plan_spec_goal_payload(plan_spec: Dict[str, Any]) -> Dict[str, Any]:
+    goal = _first_value(plan_spec, "goal", "g", "course", "target")
+    return goal if isinstance(goal, dict) else plan_spec
+
+
+def _estimated_hours_from_plans(plan_spec: Dict[str, Any]) -> Optional[float]:
+    total_minutes = 0
+    for raw_plan in _raw_plan_list(plan_spec):
+        if not isinstance(raw_plan, dict):
+            continue
+        for raw_task in _raw_task_list(raw_plan):
+            if not isinstance(raw_task, dict):
+                continue
+            total_minutes += _duration_minutes_value(
+                _first_value(
+                    raw_task,
+                    "estimated_minutes",
+                    "m",
+                    "minutes",
+                    "duration_minutes",
+                    "duration",
+                    "time",
+                ),
+                0,
+            )
+    return round(total_minutes / 60, 1) if total_minutes > 0 else None
+
+
+def _normalize_plan_spec(plan_spec: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(plan_spec, dict):
+        return []
+    raw_plans = _raw_plan_list(plan_spec)
+    if not raw_plans:
+        return []
+
+    plans: List[Dict[str, Any]] = []
+    for plan_index, raw_plan in enumerate(raw_plans, start=1):
+        if isinstance(raw_plan, str):
+            raw_plan = {"n": raw_plan, "t": [raw_plan]}
+        if not isinstance(raw_plan, dict):
+            continue
+        name = _text_or_empty(
+            _first_value(raw_plan, "name", "n", "title", "phase", "module", "stage"),
+            120,
+        ) or f"阶段 {plan_index}"
+        description = _text_or_empty(
+            _first_value(raw_plan, "description", "d", "summary", "objective", "goal"),
+            200,
+        )
+        raw_tasks = _raw_task_list(raw_plan)
+
+        normalized_tasks: List[Dict[str, Any]] = []
+        for raw_task in raw_tasks:
+            if isinstance(raw_task, str):
+                raw_task = {"title": raw_task}
+            if not isinstance(raw_task, dict):
+                continue
+            title = _text_or_empty(
+                _first_value(raw_task, "title", "t", "name", "n", "topic", "task"),
+                140,
+            )
+            if not title:
+                continue
+            difficulty = _text_or_empty(
+                _first_value(raw_task, "difficulty", "diff", "level"),
+                20,
+            ).lower()
+            if difficulty not in {"easy", "medium", "hard"}:
+                difficulty = "medium"
+            task: Dict[str, Any] = {
+                "title": title,
+                "description": _text_or_empty(
+                    _first_value(raw_task, "description", "d", "summary", "objective", "detail"),
+                    180,
+                ),
+                "difficulty": difficulty,
+                "estimated_minutes": _duration_minutes_value(
+                    _first_value(
+                        raw_task,
+                        "estimated_minutes",
+                        "m",
+                        "minutes",
+                        "duration_minutes",
+                        "duration",
+                        "time",
+                    ),
+                    60,
+                ),
+                "priority": _coerce_positive_int(
+                    _first_value(raw_task, "priority", "p", "order", "rank"),
+                    plan_index,
+                    minimum=1,
+                    maximum=5,
+                ),
+            }
+            if raw_task.get("scheduled_offset_days") is not None:
+                task["scheduled_offset_days"] = _coerce_positive_int(
+                    raw_task.get("scheduled_offset_days"),
+                    len(normalized_tasks),
+                    minimum=0,
+                    maximum=3650,
+                )
+            scheduled_date = _coerce_deadline(raw_task.get("scheduled_date"))
+            if scheduled_date:
+                task["scheduled_date"] = scheduled_date
+            normalized_tasks.append(task)
+
+        if normalized_tasks:
+            plans.append(
+                {
+                    "name": name,
+                    "description": description,
+                    "tasks": normalized_tasks,
+                }
+            )
+
+    return plans
+
+
+def _require_course_plan_spec(plan_spec: Dict[str, Any]) -> None:
+    if not isinstance(plan_spec, dict):
+        raise LearningSkillError(
+            "course-planner",
+            "course-planner returned no valid JSON object",
+        )
+    if not _normalize_plan_spec(plan_spec):
+        raise LearningSkillError(
+            "course-planner",
+            "course-planner returned no valid plans or tasks",
+        )
+    goal = _plan_spec_goal_payload(plan_spec)
+    if not isinstance(goal, dict):
+        raise LearningSkillError(
+            "course-planner",
+            "course-planner returned no goal payload",
+        )
+    if not _text_or_empty(
+        _first_value(goal, "name", "n", "title", "course_name", "goal_name"),
+        160,
+    ):
+        raise LearningSkillError(
+            "course-planner",
+            "course-planner returned an empty goal name",
+        )
+    if (
+        _float_or_none(
+            _first_value(goal, "estimated_hours", "h", "total_hours", "hours")
+        )
+        is None
+        and _estimated_hours_from_plans(plan_spec) is None
+    ):
+        raise LearningSkillError(
+            "course-planner",
+            "course-planner returned no estimated_hours",
+        )
+
+
+async def _generate_requirement_plan_spec_with_llm(
+    *,
+    draft: Dict[str, Any],
+    estimate: Dict[str, Any],
+    profile: Dict[str, Any],
+    force_retry: bool = False,
+) -> Dict[str, Any]:
+    system_message = _learning_skill_system_message("course-planner")
+    signature = _course_plan_signature(draft=draft, estimate=estimate, profile=profile)
+    if force_retry:
+        _clear_course_plan_spec_error(signature)
+
+    cached = _cached_course_plan_spec(signature)
+    if cached:
+        return cached
+
+    cached_error = _cached_course_plan_spec_error(signature)
+    if cached_error:
+        raise LearningSkillError("course-planner", cached_error)
+
+    payload = _course_planner_payload(draft=draft, estimate=estimate, profile=profile)
+    running = _COURSE_PLAN_INFLIGHT.get(signature)
+    if running is None:
+        running = asyncio.create_task(
+            asyncio.to_thread(
+                _invoke_learning_llm_json_for_thread,
+                system_message=system_message,
+                payload=payload,
+                label="course-planner",
+                max_tokens=_LEARNING_PLAN_MAX_OUTPUT_TOKENS,
+            )
+        )
+        _COURSE_PLAN_INFLIGHT[signature] = running
+        running.add_done_callback(
+            lambda completed, course_signature=signature: _store_course_plan_inflight_result(
+                course_signature,
+                completed,
+            )
+        )
+
+    if not running.done():
+        raise LearningSkillPendingError("course-planner")
+
+    parsed = await running
+
+    if not parsed:
+        _save_course_plan_spec_error(signature, "模型没有返回可用的结构化计划。")
+        raise LearningSkillError(
+            "course-planner",
+            "course-planner did not return a valid JSON object",
+        )
+    _save_course_plan_spec_cache(signature, parsed)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _goal_payload_from_plan_spec(
+    draft: Dict[str, Any],
+    estimate: Dict[str, Any],
+    plan_spec: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    goal_payload = _plan_spec_goal_payload(plan_spec) if isinstance(plan_spec, dict) else None
+    if not isinstance(goal_payload, dict):
+        goal_payload = {}
+    model_hours = _estimated_hours_from_plans(plan_spec) if isinstance(plan_spec, dict) else None
+
+    goal_type = _normalize_goal_type(goal_payload.get("goal_type") or goal_payload.get("type")) or str(
+        draft.get("goal_type") or "skill"
+    )
+    try:
+        goal_type = LearningGoalType(goal_type).value
+    except ValueError:
+        goal_type = LearningGoalType.SKILL.value
+
+    return {
+        "name": _text_or_empty(
+            _first_value(goal_payload, "name", "n", "title", "course_name", "goal_name"),
+            160,
+        )
+        or str(draft.get("goal_name") or "学习目标"),
+        "description": _text_or_empty(
+            _first_value(goal_payload, "description", "d", "summary", "objective"),
+            1200,
+        )
+        or _goal_description_from_requirement(draft),
+        "goal_type": goal_type,
+        "estimated_hours": _coerce_positive_float(
+            _first_value(goal_payload, "estimated_hours", "h", "total_hours", "hours")
+            or model_hours,
+            float(estimate.get("estimated_hours") or model_hours or 70.0),
+            minimum=1,
+            maximum=2000,
+        ),
+        "tags": _normalize_text_list(goal_payload.get("tags")) or draft.get("tags", []),
+        "prerequisites": _normalize_text_list(
+            goal_payload.get("prerequisites") or goal_payload.get("pre")
+        ),
+    }
+
+
+def _build_requirement_plans_and_tasks(
+    goal_id: str,
+    draft: Dict[str, Any],
+    estimate: Dict[str, Any],
+    now: datetime,
+    plan_spec: Optional[Dict[str, Any]] = None,
+    start_position: int = 0,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    goal_name = str(draft.get("goal_name") or "学习目标")
+    plans: List[Dict[str, Any]] = []
+    tasks: List[Dict[str, Any]] = []
+    llm_plans = _normalize_plan_spec(plan_spec)
+    if not llm_plans:
+        raise LearningSkillError(
+            "course-planner",
+            "course-planner returned no valid plans or tasks",
+        )
+
+    if llm_plans:
+        for phase_index, plan_template in enumerate(llm_plans, start=1):
+            plan_id = _generate_id()
+            phase_tasks = plan_template["tasks"]
+            plan: Dict[str, Any] = {
+                "id": plan_id,
+                "goal_id": goal_id,
+                "name": plan_template["name"],
+                "description": plan_template["description"],
+                "created_at": now.isoformat(),
+                "updated_at": now.isoformat(),
+                "total_tasks": len(phase_tasks),
+                "completed_tasks": 0,
+                "position": start_position + phase_index - 1,
+            }
+            plans.append(plan)
+
+            for position, task_template in enumerate(phase_tasks):
+                task_id = _generate_id()
+                task: Dict[str, Any] = {
+                    "id": task_id,
+                    "plan_id": plan_id,
+                    "goal_id": goal_id,
+                    "title": task_template["title"],
+                    "description": task_template["description"],
+                    "status": "pending",
+                    "difficulty": task_template["difficulty"],
+                    "estimated_minutes": task_template["estimated_minutes"],
+                    "scheduled_date": "",
+                    "completed_at": None,
+                    "created_at": now.isoformat(),
+                    "updated_at": now.isoformat(),
+                    "position": position,
+                    "priority": task_template["priority"],
+                }
+                tasks.append(task)
+
+        return plans, tasks
+
+    task_templates = {
+        "诊断与路线": [
+            "完成基础自测并记录薄弱点",
+            "拆解核心知识地图",
+            "确认阶段成果和检查标准",
+        ],
+        "核心输入": [
+            "学习本阶段核心概念",
+            "整理一页结构化笔记",
+            "完成针对性练习",
+        ],
+        "练习实战": [
+            "完成一个小型实战任务",
+            "复盘错误和卡点",
+            "补齐一个薄弱知识点",
+        ],
+        "复盘冲刺": [
+            "完成综合复盘",
+            "做一次模拟检验",
+            "更新下一阶段学习策略",
+        ],
+    }
+
+    for phase_index, phase in enumerate(estimate.get("phases", []), start=1):
+        phase_name = str(phase.get("name") or f"阶段 {phase_index}")
+        plan_id = _generate_id()
+        phase_tasks = task_templates.get(phase_name, task_templates["核心输入"])
+        plan: Dict[str, Any] = {
+            "id": plan_id,
+            "goal_id": goal_id,
+            "name": f"{goal_name} - {phase_name}",
+            "description": f"{phase_name}：预计 {phase.get('hours')} 小时",
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "total_tasks": len(phase_tasks),
+            "completed_tasks": 0,
+            "position": start_position + phase_index - 1,
+        }
+        plans.append(plan)
+
+        for position, title in enumerate(phase_tasks):
+            task_minutes = _coerce_positive_int(
+                draft.get("daily_minutes"),
+                60,
+                minimum=20,
+                maximum=120,
+            )
+            task_id = _generate_id()
+            task: Dict[str, Any] = {
+                "id": task_id,
+                "plan_id": plan_id,
+                "goal_id": goal_id,
+                "title": f"{phase_name}：{title}",
+                "description": f"围绕 {goal_name}，按「{draft.get('preference')}」方式推进。",
+                "status": "pending",
+                "difficulty": "medium",
+                "estimated_minutes": task_minutes,
+                "scheduled_date": "",
+                "completed_at": None,
+                "created_at": now.isoformat(),
+                "updated_at": now.isoformat(),
+                "position": position,
+                "priority": min(5, phase_index),
+            }
+            tasks.append(task)
+
+    return plans, tasks
+
+
+@router.post("/requirements/analyze", response_model=Dict[str, Any])
+async def analyze_learning_requirement(
+    request: Request, body: AnalyzeLearningRequirementRequest
+):
+    sessions = _load_requirement_sessions()
+    previous = sessions.get(body.session_id or "", {})
+    message = body.message.strip() or previous.get("message", "")
+    previous_answers = previous.get("answers", {})
+    answers = {**previous_answers, **body.answers}
+
+    if not message and not answers:
+        raise HTTPException(status_code=400, detail="Requirement message is required")
+
+    goals = _load_goals()
+    profile = _require_complete_learning_profile()
+    draft = _build_requirement_draft(
+        message, answers, goals, body.existing_goal_id, profile
+    )
+    llm_draft = await _generate_requirement_draft_with_llm(
+        message=message,
+        answers=answers,
+        profile=profile,
+        goals=goals,
+        existing_goal_id=body.existing_goal_id,
+    )
+    if llm_draft:
+        draft = dict(draft)
+        _apply_requirement_updates(draft, llm_draft)
+        _apply_requirement_updates(draft, answers)
+        draft["raw_text"] = message
+        draft["student_context"] = _student_context_from_profile(profile)
+        draft["time_constraints"] = _time_constraints_from_profile(profile)
+        draft = _finalize_requirement_draft(draft, message, goals)
+    missing = _missing_requirement_fields(draft)
+    estimate = _estimate_requirement(draft)
+    draft = _sync_requirement_daily_minutes(draft, estimate)
+    related = _related_goals(draft, goals)
+    profile_status = _profile_status(profile)
+    session_id = body.session_id or _generate_id()
+    now = datetime.now(timezone.utc)
+
+    result: Dict[str, Any] = {
+        "session_id": session_id,
+        "draft": draft,
+        "missing_fields": missing,
+        "questions": _requirement_questions(missing),
+        "ready": len(missing) == 0,
+        "classification": draft.get("classification"),
+        "classification_label": {
+            "new_goal": "新学习目标",
+            "goal_extension": "已有目标补充",
+            "temp_task": "临时学习任务",
+        }.get(str(draft.get("classification")), "新学习目标"),
+        "related_goals": related,
+        "estimate": estimate,
+        "profile": _profile_with_status(profile),
+        "profile_missing_fields": profile_status["missing_fields"],
+        "profile_completeness": profile_status["completeness"],
+    }
+
+    sessions[session_id] = {
+        "id": session_id,
+        "message": message,
+        "answers": answers,
+        "profile": profile,
+        "draft": draft,
+        "result": result,
+        "status": "ready" if result["ready"] else "clarifying",
+        "created_at": previous.get("created_at") or now.isoformat(),
+        "updated_at": now.isoformat(),
+    }
+    _save_requirement_sessions(sessions)
+    return result
+
+
+@router.post("/requirements/finalize", response_model=Dict[str, Any])
+async def finalize_learning_requirement(
+    request: Request, body: FinalizeLearningRequirementRequest
+):
+    profile = _require_complete_learning_profile()
+    sessions = _load_requirement_sessions()
+    session = sessions.get(body.session_id or "", {})
+    session_id = body.session_id or str(session.get("id") or _generate_id())
+    draft = body.draft or session.get("draft")
+    if not isinstance(draft, dict):
+        raise HTTPException(status_code=400, detail="Requirement draft is required")
+    draft = dict(draft)
+    _apply_requirement_updates(draft, dict(draft))
+
+    if not draft.get("student_context"):
+        draft["student_context"] = _student_context_from_profile(profile)
+    if not draft.get("time_constraints"):
+        draft["time_constraints"] = _time_constraints_from_profile(profile)
+    draft = _finalize_requirement_draft(
+        draft,
+        str(draft.get("raw_text") or session.get("message") or ""),
+        _load_goals(),
+    )
+
+    missing = _missing_requirement_fields(draft)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Requirement is incomplete",
+                "missing_fields": missing,
+                "questions": _requirement_questions(missing),
+            },
+        )
+
+    try:
+        goal_type = LearningGoalType(str(draft.get("goal_type") or "skill")).value
+    except ValueError:
+        goal_type = LearningGoalType.SKILL.value
+
+    estimate = _estimate_requirement(draft)
+    draft = _sync_requirement_daily_minutes(draft, estimate)
+    finalized_goal_id = session.get("goal_id") if session.get("status") == "finalized" else None
+    if isinstance(finalized_goal_id, str):
+        existing_goals = _load_goals()
+        if finalized_goal_id in existing_goals:
+            existing_plans = _load_plans()
+            existing_tasks = _load_tasks()
+            goal_plans, goal_tasks = _goal_records(finalized_goal_id, existing_plans, existing_tasks)
+            return {
+                "message": "该学习目标已生成，未重复创建。",
+                "status": "ready",
+                "plan_status": "ready",
+                "session_id": session_id,
+                "duplicate_goal": False,
+                "goal_created": False,
+                "goal": existing_goals[finalized_goal_id],
+                "plans": goal_plans,
+                "tasks": goal_tasks,
+                "estimate": estimate,
+            }
+
+    goals_snapshot = _load_goals()
+    existing_goal_id = draft.get("existing_goal_id")
+    use_existing_snapshot = (
+        draft.get("classification") in {"goal_extension", "temp_task"}
+        and isinstance(existing_goal_id, str)
+        and existing_goal_id in goals_snapshot
+    )
+    duplicate_snapshot = (
+        None
+        if use_existing_snapshot
+        else _find_similar_active_goal({**draft, "goal_type": goal_type}, goals_snapshot)
+    )
+    plan_spec: Dict[str, Any] = {}
+    if use_existing_snapshot or duplicate_snapshot is None:
+        plan_signature = _course_plan_signature(draft=draft, estimate=estimate, profile=profile)
+        try:
+            plan_spec = await _generate_requirement_plan_spec_with_llm(
+                draft=draft,
+                estimate=estimate,
+                profile=profile,
+                force_retry=body.force_retry,
+            )
+            _require_course_plan_spec(plan_spec)
+        except LearningSkillPendingError as exc:
+            if exc.skill_name != "course-planner":
+                raise _learning_skill_http_exception(exc) from exc
+            now = datetime.now(timezone.utc)
+            sessions = _load_requirement_sessions()
+            existing_session = sessions.get(session_id, {})
+            sessions[session_id] = {
+                **existing_session,
+                "id": session_id,
+                "draft": draft,
+                "estimate": estimate,
+                "status": "planning",
+                "plan_generation": {
+                    "status": "generating",
+                    "signature": plan_signature,
+                    "skill": "course-planner",
+                    "started_at": (
+                        existing_session.get("plan_generation", {}).get("started_at")
+                        if isinstance(existing_session.get("plan_generation"), dict)
+                        else None
+                    )
+                    or now.isoformat(),
+                    "updated_at": now.isoformat(),
+                },
+                "updated_at": now.isoformat(),
+            }
+            _save_requirement_sessions(sessions)
+            return {
+                "message": "模型正在生成学习计划，已保留本次请求；完成后会自动复用同一次模型结果。",
+                "status": "generating",
+                "plan_status": "generating",
+                "session_id": session_id,
+                "retry_after_seconds": _LEARNING_PLAN_RETRY_AFTER_SECONDS,
+                "duplicate_goal": False,
+                "duplicate_of": None,
+                "goal_created": False,
+                "goal": None,
+                "plans": [],
+                "tasks": [],
+                "estimate": estimate,
+            }
+        except LearningSkillError as exc:
+            now = datetime.now(timezone.utc)
+            sessions = _load_requirement_sessions()
+            existing_session = sessions.get(session_id, {})
+            sessions[session_id] = {
+                **existing_session,
+                "id": session_id,
+                "draft": draft,
+                "estimate": estimate,
+                "status": "planning_failed",
+                "plan_generation": {
+                    "status": "failed",
+                    "signature": plan_signature,
+                    "skill": exc.skill_name,
+                    "message": str(exc),
+                    "updated_at": now.isoformat(),
+                },
+                "updated_at": now.isoformat(),
+            }
+            _save_requirement_sessions(sessions)
+            raise _learning_skill_http_exception(exc) from exc
+    goal_payload = _goal_payload_from_plan_spec(draft, estimate, plan_spec)
+    estimate["estimated_hours"] = goal_payload["estimated_hours"]
+
+    with _LEARNING_CREATE_LOCK:
+        now = datetime.now(timezone.utc)
+        sessions = _load_requirement_sessions()
+        session = sessions.get(body.session_id or "", {})
+        goals = _load_goals()
+        plans = _load_plans()
+        tasks = _load_tasks()
+
+        finalized_goal_id = session.get("goal_id") if session.get("status") == "finalized" else None
+        if isinstance(finalized_goal_id, str) and finalized_goal_id in goals:
+            goal_plans, goal_tasks = _goal_records(finalized_goal_id, plans, tasks)
+            return {
+                "message": "该学习目标已生成，未重复创建。",
+                "status": "ready",
+                "plan_status": "ready",
+                "session_id": session_id,
+                "duplicate_goal": False,
+                "goal_created": False,
+                "goal": goals[finalized_goal_id],
+                "plans": goal_plans,
+                "tasks": goal_tasks,
+                "estimate": estimate,
+            }
+
+        existing_goal_id = draft.get("existing_goal_id")
+        use_existing_goal = (
+            draft.get("classification") in {"goal_extension", "temp_task"}
+            and isinstance(existing_goal_id, str)
+            and existing_goal_id in goals
+        )
+        duplicate_goal = None if use_existing_goal else _find_similar_active_goal({**draft, "goal_type": goal_type}, goals)
+        duplicate_reused = duplicate_goal is not None
+
+        if use_existing_goal:
+            goal_id = existing_goal_id
+            goal = goals[goal_id]
+            goal["updated_at"] = now.isoformat()
+            goal_created = False
+            new_plans, new_tasks = _build_requirement_plans_and_tasks(
+                goal_id,
+                draft,
+                estimate,
+                now,
+                plan_spec,
+                start_position=_next_plan_position(plans, goal_id),
+            )
+            for plan in new_plans:
+                plans[plan["id"]] = plan
+            for task in new_tasks:
+                tasks[task["id"]] = task
+            _refresh_today_task_schedule(
+                tasks,
+                goals,
+                profile,
+                _local_now(),
+                force=True,
+                plans=plans,
+            )
+            _save_goals(goals)
+            _save_plans(plans)
+            _save_tasks(tasks)
+        elif duplicate_goal:
+            goal_id = str(duplicate_goal["id"])
+            goal = duplicate_goal
+            goal_created = False
+            new_plans, new_tasks = _goal_records(goal_id, plans, tasks)
+        else:
+            goal_id = _generate_id()
+            target_date = draft.get("deadline")
+            if not target_date and draft.get("timeframe_days"):
+                target_date = (now.date() + timedelta(days=int(draft["timeframe_days"]))).isoformat()
+            goal = {
+                "id": goal_id,
+                "name": goal_payload["name"],
+                "description": goal_payload["description"],
+                "goal_type": goal_payload["goal_type"],
+                "status": "active",
+                "target_date": target_date,
+                "created_at": now.isoformat(),
+                "updated_at": now.isoformat(),
+                "estimated_hours": goal_payload["estimated_hours"],
+                "progress": 0.0,
+                "tags": goal_payload["tags"],
+                "prerequisites": goal_payload["prerequisites"],
+                "requirement": draft,
+            }
+            goals[goal_id] = goal
+            goal_created = True
+            new_plans, new_tasks = _build_requirement_plans_and_tasks(goal_id, draft, estimate, now, plan_spec)
+            for plan in new_plans:
+                plans[plan["id"]] = plan
+            for task in new_tasks:
+                tasks[task["id"]] = task
+            _refresh_today_task_schedule(
+                tasks,
+                goals,
+                profile,
+                _local_now(),
+                force=True,
+                plans=plans,
+            )
+            _save_goals(goals)
+            _save_plans(plans)
+            _save_tasks(tasks)
+
+        if session_id:
+            sessions[session_id] = {
+                **session,
+                "id": session_id,
+                "draft": draft,
+                "status": "finalized",
+                "goal_id": goal_id,
+                "plan_generation": {
+                    "status": "ready",
+                    "updated_at": now.isoformat(),
+                },
+                "updated_at": now.isoformat(),
+            }
+            _save_requirement_sessions(sessions)
+
+        return {
+            "message": "已复用相似学习目标，未重复创建。" if duplicate_reused else "学习目标与计划已生成",
+            "status": "ready",
+            "plan_status": "ready",
+            "session_id": session_id,
+            "duplicate_goal": duplicate_reused,
+            "duplicate_of": goal_id if duplicate_reused else None,
+            "goal_created": goal_created,
+            "goal": goal,
+            "plans": new_plans,
+            "tasks": new_tasks,
+            "estimate": estimate,
+        }
 
 
 class GeneratePlanRequest(BaseModel):
@@ -478,258 +5317,78 @@ class GeneratePlanRequest(BaseModel):
 
 @router.post("/generate", response_model=Dict[str, Any])
 async def generate_learning_plan(request: Request, body: GeneratePlanRequest):
+    profile = _require_complete_learning_profile()
+
     topic = body.topic.strip()
     if not topic:
         raise HTTPException(status_code=400, detail="Topic is required")
 
-    now = datetime.now(timezone.utc)
-    today = now.date()
-
-    GOAL_TEMPLATES = {
-        "python": {
-            "name": "学习 Python 编程",
-            "description": "从零基础到熟练掌握 Python 编程，包括基础语法、面向对象编程、常用库和项目实践",
-            "goal_type": "skill",
-            "estimated_hours": 80,
-            "plans": [
-                {
-                    "name": "Python 基础入门",
-                    "description": "学习 Python 基础语法、数据类型、控制流等",
-                    "tasks": [
-                        {"title": "安装 Python 环境", "minutes": 30, "priority": 1},
-                        {"title": "学习变量和数据类型", "minutes": 60, "priority": 1},
-                        {"title": "学习条件语句和循环", "minutes": 60, "priority": 1},
-                        {"title": "学习函数定义和调用", "minutes": 60, "priority": 1},
-                        {"title": "练习：编写第一个 Python 程序", "minutes": 45, "priority": 2},
-                    ],
-                },
-                {
-                    "name": "面向对象编程",
-                    "description": "学习类和对象、继承、封装、多态等面向对象概念",
-                    "tasks": [
-                        {"title": "学习类和对象的概念", "minutes": 60, "priority": 1},
-                        {"title": "学习继承和多态", "minutes": 90, "priority": 1},
-                        {"title": "学习封装和访问控制", "minutes": 60, "priority": 2},
-                        {"title": "练习：创建一个类并实现继承", "minutes": 60, "priority": 2},
-                    ],
-                },
-                {
-                    "name": "常用库和实战",
-                    "description": "学习常用 Python 库并进行项目实践",
-                    "tasks": [
-                        {"title": "学习 NumPy 数组操作", "minutes": 90, "priority": 1},
-                        {"title": "学习 Pandas 数据分析", "minutes": 120, "priority": 1},
-                        {"title": "学习 Matplotlib 数据可视化", "minutes": 90, "priority": 2},
-                        {"title": "实战项目：数据处理和分析", "minutes": 180, "priority": 1},
-                    ],
-                },
-            ],
-        },
-        "javascript": {
-            "name": "学习 JavaScript 编程",
-            "description": "掌握 JavaScript 语言基础和现代前端开发技术",
-            "goal_type": "skill",
-            "estimated_hours": 60,
-            "plans": [
-                {
-                    "name": "JavaScript 基础",
-                    "description": "学习 JS 基础语法、DOM 操作、事件处理",
-                    "tasks": [
-                        {"title": "学习变量、数据类型和运算符", "minutes": 60, "priority": 1},
-                        {"title": "学习条件语句和循环", "minutes": 60, "priority": 1},
-                        {"title": "学习函数和作用域", "minutes": 90, "priority": 1},
-                        {"title": "学习 DOM 操作", "minutes": 90, "priority": 1},
-                        {"title": "练习：创建交互式网页", "minutes": 60, "priority": 2},
-                    ],
-                },
-                {
-                    "name": "ES6+ 新特性",
-                    "description": "学习现代 JavaScript 语法和特性",
-                    "tasks": [
-                        {"title": "学习箭头函数和模板字符串", "minutes": 60, "priority": 1},
-                        {"title": "学习解构赋值和扩展运算符", "minutes": 60, "priority": 1},
-                        {"title": "学习 Promise 和异步编程", "minutes": 90, "priority": 1},
-                        {"title": "学习 async/await", "minutes": 60, "priority": 1},
-                    ],
-                },
-            ],
-        },
-        "react": {
-            "name": "学习 React 框架",
-            "description": "掌握 React 组件开发、状态管理和路由",
-            "goal_type": "skill",
-            "estimated_hours": 50,
-            "plans": [
-                {
-                    "name": "React 基础",
-                    "description": "学习组件、Props、State 和生命周期",
-                    "tasks": [
-                        {"title": "搭建 React 开发环境", "minutes": 30, "priority": 1},
-                        {"title": "学习函数组件和 JSX", "minutes": 60, "priority": 1},
-                        {"title": "学习 Props 和 State", "minutes": 90, "priority": 1},
-                        {"title": "学习 Hooks (useState, useEffect)", "minutes": 90, "priority": 1},
-                        {"title": "练习：创建 Todo 应用", "minutes": 120, "priority": 1},
-                    ],
-                },
-                {
-                    "name": "React 进阶",
-                    "description": "学习路由、状态管理和性能优化",
-                    "tasks": [
-                        {"title": "学习 React Router", "minutes": 60, "priority": 1},
-                        {"title": "学习 Context API", "minutes": 60, "priority": 2},
-                        {"title": "学习 Redux 状态管理", "minutes": 120, "priority": 1},
-                        {"title": "学习性能优化技巧", "minutes": 60, "priority": 2},
-                    ],
-                },
-            ],
-        },
-        "data analysis": {
-            "name": "数据分析入门",
-            "description": "掌握数据分析流程和常用工具",
-            "goal_type": "knowledge",
-            "estimated_hours": 40,
-            "plans": [
-                {
-                    "name": "数据分析基础",
-                    "description": "学习数据分析流程和统计学基础",
-                    "tasks": [
-                        {"title": "了解数据分析流程", "minutes": 60, "priority": 1},
-                        {"title": "学习描述性统计", "minutes": 90, "priority": 1},
-                        {"title": "学习数据可视化原理", "minutes": 60, "priority": 2},
-                        {"title": "练习：使用 Excel 进行简单分析", "minutes": 60, "priority": 2},
-                    ],
-                },
-                {
-                    "name": "Python 数据分析",
-                    "description": "学习使用 Python 进行数据分析",
-                    "tasks": [
-                        {"title": "学习 NumPy 基础", "minutes": 90, "priority": 1},
-                        {"title": "学习 Pandas 数据处理", "minutes": 120, "priority": 1},
-                        {"title": "学习数据清洗技巧", "minutes": 90, "priority": 1},
-                        {"title": "实战：电商数据分析项目", "minutes": 180, "priority": 1},
-                    ],
-                },
-            ],
-        },
-        "machine learning": {
-            "name": "机器学习入门",
-            "description": "掌握机器学习基础概念和常用算法",
-            "goal_type": "skill",
-            "estimated_hours": 100,
-            "plans": [
-                {
-                    "name": "数学基础",
-                    "description": "复习线性代数、微积分和概率论",
-                    "tasks": [
-                        {"title": "复习线性代数基础", "minutes": 120, "priority": 1},
-                        {"title": "复习微积分基础", "minutes": 120, "priority": 1},
-                        {"title": "复习概率论基础", "minutes": 90, "priority": 1},
-                    ],
-                },
-                {
-                    "name": "机器学习基础",
-                    "description": "学习监督学习和无监督学习算法",
-                    "tasks": [
-                        {"title": "了解机器学习概述", "minutes": 60, "priority": 1},
-                        {"title": "学习线性回归", "minutes": 120, "priority": 1},
-                        {"title": "学习逻辑回归", "minutes": 90, "priority": 1},
-                        {"title": "学习决策树和随机森林", "minutes": 120, "priority": 1},
-                        {"title": "学习聚类算法", "minutes": 90, "priority": 2},
-                    ],
-                },
-                {
-                    "name": "实战项目",
-                    "description": "动手实践机器学习项目",
-                    "tasks": [
-                        {"title": "学习 Scikit-learn 库", "minutes": 90, "priority": 1},
-                        {"title": "实战：房价预测项目", "minutes": 180, "priority": 1},
-                        {"title": "实战：图像分类项目", "minutes": 180, "priority": 1},
-                    ],
-                },
-            ],
-        },
-    }
-
-    matched_key = None
-    for key in GOAL_TEMPLATES:
-        if key in topic.lower():
-            matched_key = key
-            break
-
-    if not matched_key:
-        matched_key = "python"
-
-    template = GOAL_TEMPLATES[matched_key]
-    goal_id = _generate_id()
-
-    goal: Dict[str, Any] = {
-        "id": goal_id,
-        "name": template["name"],
-        "description": template["description"],
-        "goal_type": template["goal_type"],
-        "status": "active",
-        "target_date": None,
-        "created_at": now.isoformat(),
-        "updated_at": now.isoformat(),
-        "estimated_hours": template["estimated_hours"],
-        "progress": 0.0,
-        "tags": [topic],
-        "prerequisites": [],
-    }
-
     goals = _load_goals()
-    goals[goal_id] = goal
-    _save_goals(goals)
+    draft = _build_requirement_draft(topic, {}, goals, None, profile)
+    llm_draft = await _generate_requirement_draft_with_llm(
+        message=topic,
+        answers={},
+        profile=profile,
+        goals=goals,
+        existing_goal_id=None,
+    )
+    if llm_draft:
+        _apply_requirement_updates(draft, llm_draft)
 
-    plans = _load_plans()
-    tasks = _load_tasks()
+    profile_preferences = _normalize_text_list(profile.get("learning_preferences"))
+    draft["goal_name"] = str(draft.get("goal_name") or topic).strip()
+    draft["purpose"] = str(
+        draft.get("purpose")
+        or _purpose_from_career_target(str(profile.get("career_target") or ""))
+        or "系统学习"
+    ).strip()
+    draft["current_level"] = str(
+        draft.get("current_level") or profile.get("baseline_level") or "入门"
+    ).strip()
+    draft["target_level"] = str(draft.get("target_level") or "系统掌握并能完成实践").strip()
+    draft["daily_minutes"] = draft.get("daily_minutes") or _profile_average_daily_minutes(profile) or 60
+    draft["preference"] = str(
+        draft.get("preference")
+        or (profile_preferences[0] if profile_preferences else "")
+        or "项目实战"
+    ).strip()
+    draft["goal_type"] = _normalize_goal_type(draft.get("goal_type")) or _infer_goal_type(
+        topic,
+        str(draft.get("purpose") or ""),
+    )
+    draft["student_context"] = _student_context_from_profile(profile)
+    draft["time_constraints"] = _time_constraints_from_profile(profile)
+    draft = _finalize_requirement_draft(draft, topic, goals)
 
-    for plan_template in template["plans"]:
-        plan_id = _generate_id()
-        plan: Dict[str, Any] = {
-            "id": plan_id,
-            "goal_id": goal_id,
-            "name": plan_template["name"],
-            "description": plan_template["description"],
-            "created_at": now.isoformat(),
-            "updated_at": now.isoformat(),
-            "total_tasks": len(plan_template["tasks"]),
-            "completed_tasks": 0,
+    result = await finalize_learning_requirement(
+        request,
+        FinalizeLearningRequirementRequest(draft=draft),
+    )
+    if result.get("plan_status") == "generating":
+        return {
+            "message": result.get("message") or "模型正在生成学习计划",
+            "status": "generating",
+            "plan_status": "generating",
+            "session_id": result.get("session_id"),
+            "retry_after_seconds": result.get("retry_after_seconds"),
+            "duplicate_goal": False,
+            "duplicate_of": None,
+            "goal_created": False,
+            "goal_id": "",
+            "goal_name": str(draft.get("goal_name") or topic),
+            "total_plans": 0,
+            "total_tasks": 0,
         }
-        plans[plan_id] = plan
-
-        for task_idx, task_template in enumerate(plan_template["tasks"]):
-            task_id = _generate_id()
-            scheduled_date = (today + timedelta(days=task_idx)).isoformat()
-            task: Dict[str, Any] = {
-                "id": task_id,
-                "plan_id": plan_id,
-                "goal_id": goal_id,
-                "title": task_template["title"],
-                "description": "",
-                "status": "pending",
-                "difficulty": "medium",
-                "estimated_minutes": task_template["minutes"],
-                "scheduled_date": scheduled_date,
-                "completed_at": None,
-                "created_at": now.isoformat(),
-                "updated_at": now.isoformat(),
-                "position": task_idx,
-                "priority": task_template["priority"],
-            }
-            tasks[task_id] = task
-
-    _save_plans(plans)
-    _save_tasks(tasks)
-
     return {
-        "message": f"学习计划「{template['name']}」已成功生成！",
-        "goal_id": goal_id,
-        "goal_name": template["name"],
-        "total_plans": len(template["plans"]),
-        "total_tasks": sum(len(p["tasks"]) for p in template["plans"]),
+        "message": result.get("message") or "学习计划已生成",
+        "duplicate_goal": result.get("duplicate_goal", False),
+        "duplicate_of": result.get("duplicate_of"),
+        "goal_created": result.get("goal_created", True),
+        "goal_id": result["goal"]["id"],
+        "goal_name": result["goal"]["name"],
+        "total_plans": len(result.get("plans") or []),
+        "total_tasks": len(result.get("tasks") or []),
     }
-
 
 def _load_wrong_questions() -> Dict[str, Dict[str, Any]]:
     path = _LEARNING_DATA_DIR / "wrong_questions.json"

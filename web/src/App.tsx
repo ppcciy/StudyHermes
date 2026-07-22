@@ -31,6 +31,7 @@ import {
   FolderOpen,
   FileText,
   Globe,
+  GraduationCap,
   Heart,
   KeyRound,
   Menu,
@@ -49,6 +50,7 @@ import {
   Star,
   Terminal,
   Users,
+  UserRound,
   Webhook,
   Wrench,
   X,
@@ -79,6 +81,8 @@ import FilesPage from "@/pages/FilesPage";
 import SessionsPage from "@/pages/SessionsPage";
 import LogsPage from "@/pages/LogsPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
+import LearningPage from "@/pages/LearningPage";
+import StudentProfilePage from "@/pages/StudentProfilePage";
 import ModelsPage from "@/pages/ModelsPage";
 import CronPage from "@/pages/CronPage";
 import ProfilesPage from "@/pages/ProfilesPage";
@@ -133,6 +137,8 @@ const CHAT_NAV_ITEM: NavItem = {
 const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/": RootRedirect,
   "/sessions": SessionsPage,
+  "/student-profile": StudentProfilePage,
+  "/learning": LearningPage,
   "/files": FilesPage,
   "/analytics": AnalyticsPage,
   "/models": ModelsPage,
@@ -167,6 +173,8 @@ const BUILTIN_NAV_REST: NavItem[] = [
     label: "Sessions",
     icon: MessageSquare,
   },
+  { path: "/student-profile", label: "个人信息", icon: UserRound },
+  { path: "/learning", label: "HermesLearn", icon: GraduationCap },
   { path: "/files", label: "Files", icon: FolderOpen },
   {
     path: "/analytics",
