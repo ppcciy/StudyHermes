@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import re
 import threading
@@ -15,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel, Field
 
 from hermes_cli.config import get_hermes_home
@@ -31,6 +33,8 @@ from agent.learning_models import (
     TaskDifficulty,
     TaskStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/learning", tags=["learning"])
 
@@ -90,6 +94,184 @@ class LearningSkillPendingError(LearningSkillError):
             f"{skill_name} is still generating",
             status_code=202,
         )
+
+_FILES_DIR = get_hermes_home() / "learning" / "files"
+_FILES_DIR.mkdir(exist_ok=True)
+
+
+def _run_llm(instructions: str, user_input: str, max_tokens: int = 2048) -> str:
+    """调用项目主模型执行学习场景的一次性推理。"""
+    try:
+        from agent.auxiliary_client import (
+            auxiliary_max_tokens_param,
+            extract_content_or_reasoning,
+            get_auxiliary_extra_body,
+            resolve_provider_client,
+        )
+    except Exception as exc:
+        logger.error("Learning LLM 模块加载失败: %s", exc)
+        raise HTTPException(status_code=503, detail="LLM 服务不可用，请检查模型配置")
+
+    messages = []
+    if (instructions or "").strip():
+        messages.append({"role": "system", "content": instructions})
+    messages.append({"role": "user", "content": user_input or ""})
+
+    try:
+        client, model = resolve_provider_client("auto", task="learning")
+        if client is None or not model:
+            raise RuntimeError("no configured LLM provider/model")
+
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "timeout": 300.0,
+            "temperature": 0.2,
+            **auxiliary_max_tokens_param(max_tokens, model=model),
+        }
+        extra_body = get_auxiliary_extra_body()
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as first_exc:
+            message = str(first_exc).lower()
+            retry_kwargs = dict(kwargs)
+            if "temperature" in message or "unsupported" in message:
+                retry_kwargs.pop("temperature", None)
+            if "max_completion_tokens" in message and "max_completion_tokens" in retry_kwargs:
+                value = retry_kwargs.pop("max_completion_tokens")
+                retry_kwargs["max_tokens"] = value
+            elif "max_tokens" in message and "max_tokens" in retry_kwargs:
+                value = retry_kwargs.pop("max_tokens")
+                retry_kwargs["max_completion_tokens"] = value
+
+            if retry_kwargs != kwargs:
+                response = client.chat.completions.create(**retry_kwargs)
+            else:
+                raise
+
+        text = (extract_content_or_reasoning(response) or "").strip()
+        return _strip_markdown_code_fence(text)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Learning LLM 调用失败: %s", exc)
+        raise HTTPException(status_code=503, detail=f"LLM 分析失败: {exc}")
+
+
+def _strip_markdown_code_fence(text: str) -> str:
+    text = (text or "").strip()
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return text
+
+
+def _run_vision_llm(image_base64: str, mime_type: str, prompt: str, max_tokens: int = 2048) -> str:
+    """调用多模态 LLM 识别图片中的题目内容。"""
+    try:
+        from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+    except Exception as exc:
+        logger.error("LLM 模块加载失败: %s", exc)
+        raise HTTPException(status_code=503, detail="LLM 服务不可用，请检查模型配置")
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{image_base64}"},
+                },
+            ],
+        }
+    ]
+
+    try:
+        response = call_llm(
+            task="vision",
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.3,
+            timeout=300.0,
+        )
+        return extract_content_or_reasoning(response)
+    except Exception as exc:
+        logger.error("Vision LLM 调用失败: %s", exc)
+        raise HTTPException(status_code=503, detail=f"图片识别失败: {exc}")
+
+
+def _parse_pdf(file_bytes: bytes) -> str:
+    """解析 PDF 文件，提取文本内容。"""
+    try:
+        import io
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            from PyPDF2 import PdfReader
+        reader = PdfReader(io.BytesIO(file_bytes))
+        texts = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                texts.append(text.strip())
+        return "\n\n".join(texts)
+    except ImportError:
+        raise HTTPException(status_code=503, detail="PDF 解析需要安装 pypdf：pip install pypdf")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"PDF 解析失败: {exc}")
+
+
+def _parse_docx(file_bytes: bytes) -> str:
+    """解析 Word(.docx) 文件，提取文本内容。"""
+    try:
+        import io
+        from docx import Document
+        doc = Document(io.BytesIO(file_bytes))
+        texts = []
+        for para in doc.paragraphs:
+            if para.text.strip():
+                texts.append(para.text.strip())
+        return "\n\n".join(texts)
+    except ImportError:
+        raise HTTPException(status_code=503, detail="Word 解析需要安装 python-docx：pip install python-docx")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Word 解析失败: {exc}")
+
+
+def _save_file(file_data: str, filename: str, question_id: str, file_type: str = "question") -> str:
+    """保存文件到本地存储，返回文件路径。
+
+    Args:
+        file_data: base64 编码的文件数据
+        filename: 原始文件名
+        question_id: 错题ID
+        file_type: 文件类型 (question, correct_answer, user_answer)
+
+    Returns:
+        相对文件路径，用于存储到错题数据中
+    """
+    import base64
+    import hashlib
+
+    file_bytes = base64.b64decode(file_data)
+    file_hash = hashlib.md5(file_bytes).hexdigest()
+    ext = filename.split(".")[-1].lower() if "." in filename else "bin"
+    stored_name = f"{question_id}_{file_type}_{file_hash}.{ext}"
+    stored_path = _FILES_DIR / stored_name
+
+    stored_path.write_bytes(file_bytes)
+    return f"files/{stored_name}"
+
+
+def _get_file_path(relative_path: str) -> Path:
+    """根据相对路径获取文件的绝对路径。"""
+    return _FILES_DIR / relative_path.split("/")[-1]
 
 
 class CreateLearningGoalRequest(BaseModel):
@@ -5437,6 +5619,9 @@ class CreateWrongQuestionRequest(BaseModel):
     error_analysis: str = Field(default="", description="错误分析")
     solution: str = Field(default="", description="解题思路")
     tags: List[str] = Field(default_factory=list)
+    question_file: Optional[str] = Field(default=None, description="题目原始文件路径")
+    correct_answer_file: Optional[str] = Field(default=None, description="正确答案原始文件路径")
+    user_answer_file: Optional[str] = Field(default=None, description="用户答案原始文件路径")
 
 
 class UpdateWrongQuestionRequest(BaseModel):
@@ -5450,6 +5635,9 @@ class UpdateWrongQuestionRequest(BaseModel):
     error_analysis: Optional[str] = None
     solution: Optional[str] = None
     tags: Optional[List[str]] = None
+    question_file: Optional[str] = None
+    correct_answer_file: Optional[str] = None
+    user_answer_file: Optional[str] = None
 
 
 class ReviewQuestionRequest(BaseModel):
@@ -5523,8 +5711,9 @@ async def create_wrong_question(request: Request, body: CreateWrongQuestionReque
         "error_analysis": body.error_analysis,
         "solution": body.solution,
         "tags": body.tags,
-        "image_path": None,
-        "source_file": None,
+        "question_file": body.question_file,
+        "correct_answer_file": body.correct_answer_file,
+        "user_answer_file": body.user_answer_file,
         "created_at": now.isoformat(),
         "updated_at": now.isoformat(),
         "review_count": 0,
@@ -5575,6 +5764,12 @@ async def update_wrong_question(request: Request, question_id: str, body: Update
         question["solution"] = body.solution
     if body.tags is not None:
         question["tags"] = body.tags
+    if body.question_file is not None:
+        question["question_file"] = body.question_file
+    if body.correct_answer_file is not None:
+        question["correct_answer_file"] = body.correct_answer_file
+    if body.user_answer_file is not None:
+        question["user_answer_file"] = body.user_answer_file
 
     question["updated_at"] = datetime.now(timezone.utc).isoformat()
     _save_wrong_questions(questions)
@@ -5663,6 +5858,7 @@ async def get_question_reviews(request: Request, question_id: str):
     return [r for r in reviews.values() if r["question_id"] == question_id]
 
 
+@router.get("/wrong-question-stats", response_model=Dict[str, Any])
 @router.get("/wrong-questions/stats", response_model=Dict[str, Any])
 async def get_wrong_question_stats(request: Request):
     questions = _load_wrong_questions()
@@ -5695,6 +5891,7 @@ async def get_wrong_question_stats(request: Request):
     }
 
 
+@router.get("/wrong-questions-need-review", response_model=List[Dict[str, Any]])
 @router.get("/wrong-questions/need-review", response_model=List[Dict[str, Any]])
 async def get_questions_need_review(request: Request):
     questions = _load_wrong_questions()
@@ -5707,3 +5904,1077 @@ async def get_questions_need_review(request: Request):
 
     result.sort(key=lambda q: q["next_review_at"])
     return result
+
+
+# ---------------------------------------------------------------------------
+# AI 分析：知识点识别 / 错误原因分析 / 生成解析
+# ---------------------------------------------------------------------------
+
+class AnalyzeQuestionResponse(BaseModel):
+    knowledge_points: List[str] = Field(default_factory=list, description="识别出的知识点")
+    error_reason: str = Field(default="", description="错误原因分析")
+    solution: str = Field(default="", description="详细解题思路")
+    related_concepts: List[str] = Field(default_factory=list, description="相关概念")
+    difficulty_suggestion: str = Field(default="", description="难度建议")
+
+
+@router.post("/wrong-questions/{question_id}/analyze", response_model=Dict[str, Any])
+async def analyze_wrong_question(request: Request, question_id: str):
+    """AI 分析错题：识别知识点、分析错误原因、生成解题思路。"""
+    questions = _load_wrong_questions()
+    if question_id not in questions:
+        raise HTTPException(status_code=404, detail="错题不存在")
+
+    q = questions[question_id]
+
+    instructions = (
+        "你是一位经验丰富的学科教师，擅长分析学生的错题并给出针对性指导。\n"
+        "必须根据题目内容、学生答案和正确答案做具体分析，不能写泛泛而谈的套话。\n"
+        "如果是编程题，solution 必须包含算法思路、关键步骤、复杂度或易错点。\n"
+        "如果学生答案或正确答案明显缺失/无意义，也要结合题干指出无法判断的部分，并仍然给出题目本身的正确解法。\n"
+        "请分析以下错题，并以 JSON 格式返回结果，包含以下字段：\n"
+        "- knowledge_points: 知识点列表（数组）\n"
+        "- error_reason: 错误原因分析（字符串，必须指出具体误区/遗漏/错误步骤）\n"
+        "- solution: 详细解题思路（字符串，必须分步骤讲解，不少于 120 字）\n"
+        "- related_concepts: 相关概念列表（数组）\n"
+        "- difficulty_suggestion: 难度建议（easy/medium/hard）\n\n"
+        "只返回 JSON，不要添加其他内容。JSON 字符串中的换行必须写成 \\n，双引号必须正确转义。"
+    )
+
+    user_input = (
+        f"学科：{q['subject']}\n"
+        f"知识点：{q['knowledge_point']}\n"
+        f"题目内容：{q['question_content']}\n"
+        f"学生答案：{q['user_answer']}\n"
+        f"正确答案：{q['correct_answer']}\n"
+        f"当前错误类型：{q['error_type']}\n"
+        f"当前难度：{q['difficulty']}"
+    )
+
+    parsed: Dict[str, Any] = {}
+    last_issues: List[str] = []
+    attempt_input = user_input
+    for attempt in range(2):
+        raw = await asyncio.to_thread(_run_llm, instructions, attempt_input, 3072)
+        try:
+            parsed_raw = _parse_llm_json(raw)
+            if not isinstance(parsed_raw, dict):
+                raise ValueError("LLM response is not a JSON object")
+            parsed = _clean_analysis(parsed_raw, q)
+            break
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_issues = [f"JSON 解析失败：{exc}"]
+
+        if attempt == 1:
+            parsed = _analysis_from_raw_llm_text(raw, q)
+            break
+
+        raw_excerpt = raw.strip()
+        if len(raw_excerpt) > 4000:
+            raw_excerpt = raw_excerpt[:4000] + "\n[内容已截断]"
+        attempt_input = (
+            f"{user_input}\n\n"
+            f"上一次分析结果格式无法解析：{'；'.join(last_issues)}。\n"
+            f"上一次模型返回如下：\n{raw_excerpt}\n\n"
+            "请修正格式并重新生成 JSON。"
+        )
+
+    if not parsed:
+        raise HTTPException(status_code=502, detail=f"AI 分析结果格式无法解析：{'；'.join(last_issues)}")
+
+    # 将分析结果写回错题（更新 error_analysis 和 solution）
+    if parsed.get("error_reason"):
+        q["error_analysis"] = parsed["error_reason"]
+    if parsed.get("solution"):
+        q["solution"] = parsed["solution"]
+    q["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _save_wrong_questions(questions)
+
+    return {
+        "question_id": question_id,
+        "analysis": parsed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 相似题推荐
+# ---------------------------------------------------------------------------
+
+class SimilarQuestionResponse(BaseModel):
+    id: str
+    original_question_id: str
+    question_content: str
+    correct_answer: str
+    explanation: str = ""
+    options: Optional[List[str]] = None
+    created_at: str
+
+
+@router.post("/wrong-questions/{question_id}/similar", response_model=Dict[str, Any])
+async def generate_similar_question(request: Request, question_id: str):
+    """基于错题生成相似练习题。"""
+    questions = _load_wrong_questions()
+    if question_id not in questions:
+        raise HTTPException(status_code=404, detail="错题不存在")
+
+    q = questions[question_id]
+
+    instructions = (
+        "你是一位出题专家。请根据给定的错题，生成一道真正的新练习题。\n"
+        "要求：\n"
+        "1. 考查相同知识点，但必须更换题目数据、情境或输入输出样例\n"
+        "2. 不允许复制原题，不允许在题目中出现“参考原题”“请围绕”“重新完成一道同类型练习题”等模板话术\n"
+        "3. 如果是编程题，question_content 必须是一道完整题面，包含输入输出示例或约束；correct_answer 必须是新题答案，不要返回 0 这种占位值\n"
+        "4. explanation 必须说明新题的解法思路，不少于 60 字\n"
+        "5. 以 JSON 格式返回，包含字段：\n"
+        "   - question_content: 题目内容\n"
+        "   - correct_answer: 正确答案\n"
+        "   - explanation: 解题说明\n"
+        "   - options: 选项列表（如果是选择题，否则为 null）\n\n"
+        "只返回 JSON，不要添加其他内容。JSON 字符串中的换行必须写成 \\n，双引号必须正确转义。"
+    )
+
+    original_question_text = str(q.get("question_content") or "")
+    user_input = (
+        f"学科：{q['subject']}\n"
+        f"知识点：{q['knowledge_point']}\n"
+        f"原题内容（仅用于理解考点，不可复制到新题中）：{original_question_text}\n"
+        f"正确答案：{q['correct_answer']}\n"
+        f"难度：{q['difficulty']}\n"
+        "请直接输出新题本身，不要输出生成任务说明。"
+    )
+
+    parsed: Dict[str, Any] = {}
+    last_issues: List[str] = []
+    attempt_input = user_input
+    try:
+        for attempt in range(2):
+            raw = await asyncio.to_thread(_run_llm, instructions, attempt_input, 3072)
+            try:
+                parsed_raw = _parse_llm_json(raw)
+                if not isinstance(parsed_raw, dict):
+                    raise ValueError("LLM response is not a JSON object")
+                parsed = _clean_similar_question(parsed_raw, q)
+                break
+            except (json.JSONDecodeError, ValueError) as exc:
+                last_issues = [f"JSON 解析失败：{exc}"]
+
+            if attempt == 1:
+                parsed = _similar_from_raw_llm_text(raw)
+                break
+
+            raw_excerpt = raw.strip()
+            if len(raw_excerpt) > 4000:
+                raw_excerpt = raw_excerpt[:4000] + "\n[内容已截断]"
+            attempt_input = (
+                f"{user_input}\n\n"
+                f"上一次相似题格式无法解析：{'；'.join(last_issues)}。\n"
+                f"上一次模型返回如下：\n{raw_excerpt}\n\n"
+                "请修正格式并重新生成 JSON。"
+            )
+    except HTTPException:
+        raise
+
+    if not parsed:
+        raise HTTPException(status_code=502, detail=f"AI 相似题生成结果格式无法解析：{'；'.join(last_issues)}")
+
+    similar_id = _generate_id()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    similar_record: Dict[str, Any] = {
+        "id": similar_id,
+        "original_question_id": question_id,
+        "question_content": parsed.get("question_content", ""),
+        "correct_answer": parsed.get("correct_answer", ""),
+        "explanation": parsed.get("explanation", ""),
+        "options": parsed.get("options"),
+        "created_at": now_iso,
+    }
+
+    similar_store = _load_similar_questions()
+    similar_store[similar_id] = similar_record
+    _save_similar_questions(similar_store)
+
+    return similar_record
+
+
+@router.get("/wrong-questions/{question_id}/similar", response_model=List[Dict[str, Any]])
+async def get_similar_questions(request: Request, question_id: str):
+    """获取某道错题的所有相似练习题。"""
+    similar = _load_similar_questions()
+    result = [s for s in similar.values() if s["original_question_id"] == question_id]
+    result.sort(key=lambda s: s["created_at"], reverse=True)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 分析研究报告
+# ---------------------------------------------------------------------------
+
+class ReportResponse(BaseModel):
+    summary: str = Field(default="", description="总体概况")
+    weak_points: List[str] = Field(default_factory=list, description="薄弱知识点")
+    error_patterns: List[str] = Field(default_factory=list, description="错误模式")
+    suggestions: List[str] = Field(default_factory=list, description="改进建议")
+    review_plan: str = Field(default="", description="复习计划建议")
+
+
+@router.get("/wrong-question-report", response_model=Dict[str, Any])
+@router.get("/wrong-questions/report", response_model=Dict[str, Any])
+async def get_wrong_question_report(
+    request: Request,
+    subject: Optional[str] = None,
+):
+    """生成错题分析研究报告。
+
+    可选 subject 参数按学科过滤。报告包含总体概况、薄弱知识点、
+    错误模式、改进建议和复习计划。
+    """
+    questions = _load_wrong_questions()
+    q_list = list(questions.values())
+
+    if subject:
+        q_list = [q for q in q_list if q["subject"] == subject]
+
+    if not q_list:
+        return {
+            "subject": subject,
+            "total_questions": 0,
+            "total_reviews": 0,
+            "accuracy": 0.0,
+            "by_knowledge": {},
+            "by_error_type": {},
+            "by_mastery": {},
+            "report": {
+                "summary": "暂无错题数据。添加错题后，这里会生成统计概览、薄弱知识点和复习建议。",
+                "weak_points": [],
+                "error_patterns": [],
+                "suggestions": ["先添加错题，再按学科和知识点持续复盘。"],
+                "review_plan": "",
+            },
+        }
+
+    # 先生成统计摘要（纯统计部分，不需要 LLM）
+    by_knowledge: Dict[str, int] = {}
+    by_error_type: Dict[str, int] = {}
+    by_mastery: Dict[str, int] = {}
+    total_reviews = 0
+    total_correct = 0
+
+    for q in q_list:
+        by_knowledge[q["knowledge_point"]] = by_knowledge.get(q["knowledge_point"], 0) + 1
+        by_error_type[q["error_type"]] = by_error_type.get(q["error_type"], 0) + 1
+        by_mastery[q["mastery_status"]] = by_mastery.get(q["mastery_status"], 0) + 1
+        total_reviews += q.get("review_count", 0)
+        total_correct += q.get("correct_count", 0)
+
+    weak_knowledge = sorted(by_knowledge.items(), key=lambda x: x[1], reverse=True)[:5]
+    frequent_errors = sorted(by_error_type.items(), key=lambda x: x[1], reverse=True)
+
+    accuracy = round((total_correct / total_reviews * 100), 1) if total_reviews > 0 else 0.0
+
+    # 调用 LLM 生成深度分析报告
+    instructions = (
+        "你是一位学习分析师，请根据学生的错题统计数据生成一份分析研究报告。\n"
+        "以 JSON 格式返回，包含以下字段：\n"
+        "- summary: 总体概况（字符串，2-3 段，分析学习现状）\n"
+        "- weak_points: 薄弱知识点列表（数组，指出最需要加强的知识点）\n"
+        "- error_patterns: 错误模式分析（数组，总结反复出现的错误类型）\n"
+        "- suggestions: 改进建议（数组，给出具体可执行的学习建议）\n"
+        "- review_plan: 复习计划建议（字符串，给出未来一周的复习安排建议）\n\n"
+        "只返回 JSON，不要添加其他内容。"
+    )
+
+    user_input = (
+        f"学科范围：{subject or '全部'}\n"
+        f"错题总数：{len(q_list)}\n"
+        f"总复习次数：{total_reviews}\n"
+        f"复习正确率：{accuracy}%\n\n"
+        f"知识点错题分布（前5）：{dict(weak_knowledge)}\n"
+        f"错误类型分布：{dict(frequent_errors)}\n"
+        f"掌握状态分布：{by_mastery}\n\n"
+        f"错题列表（前10题摘要）：\n"
+    )
+    for idx, q in enumerate(q_list[:10], 1):
+        user_input += (
+            f"{idx}. [{q['subject']}] {q['knowledge_point']} - "
+            f"{q['question_content'][:60]}... "
+            f"(错误类型: {q['error_type']}, 掌握: {q['mastery_status']})\n"
+        )
+
+    fallback_report: Dict[str, Any] = {
+        "summary": (
+            f"当前共有 {len(q_list)} 道错题，累计复习 {total_reviews} 次，复习正确率为 {accuracy}%。"
+            "建议优先处理出现频率最高的知识点，并结合待复习题目安排短周期复盘。"
+        ),
+        "weak_points": [k for k, _ in weak_knowledge],
+        "error_patterns": [k for k, _ in frequent_errors],
+        "suggestions": [
+            "优先复习错题数量最多的知识点。",
+            "每次复习后记录错因，区分概念、审题、计算和策略问题。",
+            "对已掌握题目拉长复习间隔，对薄弱题目保持高频回看。",
+        ],
+        "review_plan": "本周先集中复习高频错题知识点，再穿插相似题训练，最后用待复习列表做查漏补缺。",
+    }
+
+    try:
+        raw = await asyncio.to_thread(_run_llm, instructions, user_input, 3072)
+        parsed_raw = _parse_llm_json(raw)
+        if not isinstance(parsed_raw, dict):
+            raise ValueError("LLM response is not a JSON object")
+        parsed = {
+            "summary": str(parsed_raw.get("summary") or fallback_report["summary"]),
+            "weak_points": parsed_raw.get("weak_points") if isinstance(parsed_raw.get("weak_points"), list) else fallback_report["weak_points"],
+            "error_patterns": parsed_raw.get("error_patterns") if isinstance(parsed_raw.get("error_patterns"), list) else fallback_report["error_patterns"],
+            "suggestions": parsed_raw.get("suggestions") if isinstance(parsed_raw.get("suggestions"), list) else fallback_report["suggestions"],
+            "review_plan": str(parsed_raw.get("review_plan") or fallback_report["review_plan"]),
+        }
+    except (HTTPException, json.JSONDecodeError, ValueError):
+        parsed = fallback_report
+
+    return {
+        "subject": subject,
+        "total_questions": len(q_list),
+        "total_reviews": total_reviews,
+        "accuracy": accuracy,
+        "by_knowledge": by_knowledge,
+        "by_error_type": by_error_type,
+        "by_mastery": by_mastery,
+        "report": parsed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 文件上传解析 + AI 自动提取
+# ---------------------------------------------------------------------------
+
+class AiExtractResult(BaseModel):
+    subject: str = Field(default="", description="学科")
+    knowledge_point: str = Field(default="", description="知识点")
+    question_content: str = Field(default="", description="题目内容")
+    user_answer: str = Field(default="", description="用户答案")
+    correct_answer: str = Field(default="", description="正确答案")
+    error_type: str = Field(default="other", description="错误类型")
+    difficulty: str = Field(default="medium", description="难度")
+    error_analysis: str = Field(default="", description="错误分析")
+    solution: str = Field(default="", description="解题思路")
+
+
+_EXTRACT_INSTRUCTIONS = (
+    "你是一位学科教师，请从以下题目文本中提取结构化信息。\n"
+    "以 JSON 格式返回，包含以下字段：\n"
+    "- subject: 学科或课程名称（根据题目真实课程识别，例如：数据结构、线性代数、数字电路、自动控制原理、数据库系统；不要限制在中小学学科内）\n"
+    "- knowledge_point: 知识点（一句话描述）\n"
+    "- question_content: 题目完整内容\n"
+    "- user_answer: 用户的答案（如果文本中有则填，没有则空字符串）\n"
+    "- correct_answer: 正确答案（如果文本中有则填，没有则空字符串）\n"
+    "- error_type: 错误类型（从以下选择：concept_misunderstanding/calculation_error/misreading/careless/strategy_error/other）\n"
+    "- difficulty: 难度（easy/medium/hard）\n"
+    "- error_analysis: 错误原因分析（如果没有用户答案则留空）\n"
+    "- solution: 解题思路\n\n"
+    "只返回 JSON，不要添加其他内容。"
+)
+
+
+_EXTRACT_INSTRUCTIONS += (
+    "\nAlways infer subject and knowledge_point from the question itself. "
+    "Do not leave subject or knowledge_point empty when question_content is present. "
+    "Return valid JSON only."
+)
+
+
+_LLM_FIELD_ALIASES: Dict[str, List[str]] = {
+    "knowledge_points": ["knowledge_points", "knowledge point", "knowledge points", "knowledgepoints", "知识点", "识别知识点"],
+    "error_reason": ["error_reason", "error reason", "error analysis", "错误原因", "错因分析", "错误分析"],
+    "solution": ["solution", "detail_solution", "detailed_solution", "detail solution", "detail", "解题思路", "详细解析", "详细解答", "解析"],
+    "related_concepts": ["related_concepts", "relatedrelated_concepts", "related concepts", "relatedconcepts", "相关概念"],
+    "difficulty_suggestion": ["difficulty_suggestion", "difficulty suggestion", "难度建议"],
+    "question_content": ["question_content", "question content", "题目内容", "题干", "新题"],
+    "correct_answer": ["correct_answer", "correct answer", "正确答案", "答案"],
+    "explanation": ["explanation", "解析说明", "解题说明"],
+    "options": ["options", "选项"],
+    "subject": ["subject", "学科"],
+    "knowledge_point": ["knowledge_point", "knowledge point", "知识点"],
+    "user_answer": ["user_answer", "user answer", "我的答案", "学生答案"],
+    "error_type": ["error_type", "error type", "错误类型"],
+    "difficulty": ["difficulty", "难度"],
+    "error_analysis": ["error_analysis", "error analysis", "错误分析"],
+    "summary": ["summary", "总结", "总体概况"],
+    "weak_points": ["weak_points", "weak points", "薄弱知识点"],
+    "error_patterns": ["error_patterns", "error patterns", "错误模式"],
+    "suggestions": ["suggestions", "建议", "改进建议"],
+    "review_plan": ["review_plan", "review plan", "复习计划"],
+}
+
+_LIST_LLM_FIELDS = {
+    "knowledge_points",
+    "related_concepts",
+    "options",
+    "weak_points",
+    "error_patterns",
+    "suggestions",
+}
+
+
+def _canonical_llm_field_name(name: Any) -> str:
+    normalized = re.sub(r"[\s_\-]+", "", str(name or "").strip().lower())
+    for canonical, aliases in _LLM_FIELD_ALIASES.items():
+        if normalized == re.sub(r"[\s_\-]+", "", canonical.lower()):
+            return canonical
+        for alias in aliases:
+            if normalized == re.sub(r"[\s_\-]+", "", alias.lower()):
+                return canonical
+    return str(name or "")
+
+
+def _normalize_llm_field_names(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {}
+    for key, value in parsed.items():
+        canonical = _canonical_llm_field_name(key)
+        normalized.setdefault(canonical, value)
+    return normalized
+
+
+def _strip_llm_container(raw: str) -> str:
+    cleaned = raw.strip().lstrip("\ufeff")
+    if cleaned.startswith("```"):
+        first_newline = cleaned.find("\n")
+        if first_newline >= 0:
+            cleaned = cleaned[first_newline + 1:]
+        if cleaned.rstrip().endswith("```"):
+            cleaned = cleaned.rstrip()[:-3].rstrip()
+    return cleaned.strip()
+
+
+def _try_parse_json_object(cleaned: str) -> Dict[str, Any]:
+    decoder = json.JSONDecoder(strict=False)
+    starts = [0]
+    starts.extend(index for index, char in enumerate(cleaned) if char in "[{" and index != 0)
+    last_error: Optional[Exception] = None
+
+    for start in starts:
+        candidate = cleaned[start:].lstrip()
+        if not candidate:
+            continue
+        try:
+            parsed, _end = decoder.raw_decode(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+
+        if isinstance(parsed, dict):
+            return _normalize_llm_field_names(parsed)
+        if isinstance(parsed, list):
+            dict_items = [item for item in parsed if isinstance(item, dict)]
+            if len(dict_items) == 1:
+                return _normalize_llm_field_names(dict_items[0])
+            if dict_items:
+                return {"items": [_normalize_llm_field_names(item) for item in dict_items]}
+        last_error = ValueError("LLM response is not a JSON object")
+
+    if last_error is not None:
+        raise last_error
+    raise ValueError("LLM response does not contain a JSON object")
+
+
+def _decode_loose_string(value: str) -> str:
+    text = value.strip()
+    while text.endswith(","):
+        text = text[:-1].rstrip()
+    if text in {"null", "None", "NONE"}:
+        return ""
+    if len(text) >= 2 and text[0] in "\"'" and text[-1] == text[0]:
+        text = text[1:-1]
+    elif text.startswith(("\"", "'")):
+        text = text[1:]
+    if "\\" not in text:
+        return _clean_llm_text(text)
+    if re.search(r"\\u[0-9a-fA-F]{4}|\\U[0-9a-fA-F]{8}", text):
+        text = _decode_unicode_escape_sequences(text)
+    try:
+        return _clean_llm_text(
+            text.replace(r"\"", '"')
+            .replace(r"\n", "\n")
+            .replace(r"\r", "\n")
+            .replace(r"\t", "\t")
+            .replace(r"\/", "/")
+            .replace(r"\\", "\\")
+        )
+    except Exception:
+        return _clean_llm_text(text)
+
+
+def _decode_unicode_escape_sequences(text: str) -> str:
+    def replace_short(match: re.Match[str]) -> str:
+        return chr(int(match.group(1), 16))
+
+    def replace_long(match: re.Match[str]) -> str:
+        return chr(int(match.group(1), 16))
+
+    text = re.sub(r"\\u([0-9a-fA-F]{4})", replace_short, text)
+    return re.sub(r"\\U([0-9a-fA-F]{8})", replace_long, text)
+
+
+def _clean_llm_text(value: Any) -> str:
+    text = str(value or "")
+    text = text.replace("\ufffd", "")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    text = _trim_repetitive_llm_noise(text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"\s+([,，。；;：:])", r"\1", text)
+    text = re.sub(r"([,，；;：:])\s+", r"\1", text)
+    text = text.strip(" \t\r\n,，")
+    return text
+
+
+def _trim_repetitive_llm_noise(text: str) -> str:
+    if not text:
+        return ""
+
+    repeated_match = re.search(r"([^\sA-Za-z0-9])(?:\s*\1){15,}", text)
+    if repeated_match:
+        prefix = text[: repeated_match.start()].rstrip(" \t\r\n,，。；;：:\"'“”")
+        suffix = text[repeated_match.end():]
+        if len(prefix) >= 20:
+            return prefix
+        text = (prefix + "\n" + suffix).strip()
+
+    cleaned_lines: List[str] = []
+    for line in text.splitlines():
+        compact = re.sub(r"\s+", "", line)
+        if len(compact) >= 80:
+            counts: Dict[str, int] = {}
+            for char in compact:
+                counts[char] = counts.get(char, 0) + 1
+            dominant = max(counts.values()) if counts else 0
+            if dominant / len(compact) >= 0.45:
+                continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def _split_loose_list(value: str) -> List[str]:
+    text = value.strip().rstrip(",")
+    if not text or text in {"null", "None", "NONE"}:
+        return []
+    try:
+        parsed = json.loads(text, strict=False)
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+    except Exception:
+        pass
+
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    pieces = re.split(r"[,，;；\n]+", text)
+    return [_decode_loose_string(piece).strip(" -") for piece in pieces if _decode_loose_string(piece).strip(" -")]
+
+
+def _coerce_loose_value(field: str, value: str) -> Any:
+    text = value.strip()
+    while text.endswith("}") and text.count("{") < text.count("}"):
+        text = text[:-1].rstrip()
+    while text.endswith(","):
+        text = text[:-1].rstrip()
+
+    if field in _LIST_LLM_FIELDS:
+        if text in {"null", "None", "NONE"}:
+            return None if field == "options" else []
+        return _split_loose_list(text)
+    if text.startswith("[") and text.endswith("]"):
+        values = _split_loose_list(text)
+        return values
+    return _decode_loose_string(text)
+
+
+def _parse_loose_llm_object(cleaned: str) -> Dict[str, Any]:
+    aliases: List[tuple[str, str]] = []
+    for canonical, names in _LLM_FIELD_ALIASES.items():
+        for name in names:
+            aliases.append((canonical, name))
+    aliases.sort(key=lambda item: len(item[1]), reverse=True)
+
+    matches: List[tuple[int, int, str]] = []
+    for canonical, alias in aliases:
+        pattern = re.compile(
+            rf"(?im)(?:^|[{{,\n]\s*)[\"'`]?{re.escape(alias)}[\"'`]?\s*[:：]\s*"
+        )
+        for match in pattern.finditer(cleaned):
+            matches.append((match.start(), match.end(), canonical))
+
+    if not matches:
+        raise ValueError("LLM response does not contain recognizable fields")
+
+    matches.sort(key=lambda item: item[0])
+    parsed: Dict[str, Any] = {}
+    for index, (_match_start, value_start, field) in enumerate(matches):
+        value_end = matches[index + 1][0] if index + 1 < len(matches) else len(cleaned)
+        raw_value = cleaned[value_start:value_end].strip()
+        if not raw_value:
+            continue
+        parsed.setdefault(field, _coerce_loose_value(field, raw_value))
+
+    if not parsed:
+        raise ValueError("LLM response fields are empty")
+    return parsed
+
+
+def _parse_llm_json(raw: str) -> Dict[str, Any]:
+    """Parse JSON-like model output while preserving real LLM content."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("LLM returned an empty response")
+
+    cleaned = _strip_llm_container(raw)
+    try:
+        return _try_parse_json_object(cleaned)
+    except (json.JSONDecodeError, ValueError) as strict_error:
+        try:
+            return _parse_loose_llm_object(cleaned)
+        except ValueError:
+            raise strict_error
+
+
+def _infer_subject_and_knowledge(text: str) -> tuple[str, str]:
+    normalized = (text or "").lower()
+    original = text or ""
+
+    programming_points = [
+        ("二叉树", ["二叉树", "binary tree", "root =", "treenode", "翻转二叉树", "树的翻转"]),
+        ("链表", ["链表", "linked list", "listnode"]),
+        ("数组", ["数组", "array", "nums", "下标"]),
+        ("字符串", ["字符串", "string", "子串"]),
+        ("动态规划", ["动态规划", "dp", "状态转移"]),
+        ("栈和队列", ["栈", "队列", "stack", "queue"]),
+        ("哈希表", ["哈希", "hash", "map", "字典"]),
+        ("递归", ["递归", "recursion"]),
+        ("算法", ["leetcode", "输入：", "输出：", "示例", "class solution", "def ", "return "]),
+    ]
+
+    for point, keywords in programming_points:
+        if any(keyword.lower() in normalized or keyword in original for keyword in keywords):
+            return "编程", point
+
+    subject_keywords = [
+        ("数学", ["函数", "方程", "几何", "概率", "导数", "积分", "数列"]),
+        ("物理", ["速度", "加速度", "电路", "电压", "电流", "力学", "功率"]),
+        ("化学", ["化学式", "反应", "溶液", "物质的量", "离子"]),
+        ("英语", ["grammar", "reading", "choose the best", "单词", "语法"]),
+        ("语文", ["阅读理解", "文言文", "古诗", "作文", "修辞"]),
+    ]
+
+    for subject, keywords in subject_keywords:
+        if any(keyword.lower() in normalized or keyword in original for keyword in keywords):
+            return subject, keywords[0]
+
+    return "其他", ""
+
+
+def _normalize_subject(value: str, source_text: str) -> str:
+    subject = (value or "").strip()
+    aliases = {
+        "coding": "编程",
+        "programming": "编程",
+        "math": "数学",
+        "mathematics": "数学",
+    }
+    subject = aliases.get(subject.lower(), aliases.get(subject, subject))
+    if subject:
+        return subject
+    inferred, _knowledge = _infer_subject_and_knowledge(source_text)
+    return inferred
+
+
+def _is_unparsed_ai_text(value: str) -> bool:
+    text = (value or "").strip()
+    if not text:
+        return False
+    if "AI 返回内容无法解析" in text or "AI returned content" in text:
+        return True
+    return text.startswith("{") and (
+        '"knowledge_points"' in text or '"error_reason"' in text or '"solution"' in text
+    )
+
+
+def _normalize_compare_text(value: str) -> str:
+    return "".join(ch.lower() for ch in (value or "") if ch.isalnum())
+
+
+def _listify_text(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _analysis_quality_issues(analysis: Dict[str, Any], question: Dict[str, Any]) -> List[str]:
+    issues: List[str] = []
+    joined = "\n".join(
+        [
+            str(analysis.get("error_reason") or ""),
+            str(analysis.get("solution") or ""),
+            " ".join(str(item) for item in analysis.get("knowledge_points") or []),
+        ]
+    )
+    knowledge = str(question.get("knowledge_point") or "").strip()
+
+    if not analysis.get("knowledge_points"):
+        issues.append("knowledge_points 不能为空")
+    if len(str(analysis.get("error_reason") or "").strip()) < 40:
+        issues.append("error_reason 过短，必须具体说明学生错在哪里")
+    if len(str(analysis.get("solution") or "").strip()) < 120:
+        issues.append("solution 过短，必须给出可执行的分步解析")
+    if _is_unparsed_ai_text(str(analysis.get("solution") or "")):
+        issues.append("solution 仍然是未解析的 JSON 或错误文本")
+    if knowledge and knowledge not in joined:
+        issues.append(f"分析内容没有围绕知识点「{knowledge}」展开")
+
+    generic_phrases = [
+        "当前答案与正确答案不一致",
+        "建议重点核对题意",
+        "你的答案与正确答案存在差异",
+        "把握不够准确",
+        "AI 返回内容无法解析",
+    ]
+    if any(phrase in joined for phrase in generic_phrases):
+        issues.append("分析内容仍然是通用套话")
+
+    return issues
+
+
+def _similar_quality_issues(similar: Dict[str, Any], question: Dict[str, Any]) -> List[str]:
+    issues: List[str] = []
+    generated = str(similar.get("question_content") or "").strip()
+    original = str(question.get("question_content") or "").strip()
+    explanation = str(similar.get("explanation") or "").strip()
+    correct_answer = str(similar.get("correct_answer") or "").strip()
+
+    if len(generated) < 80:
+        issues.append("question_content 过短，必须是一道完整新题")
+    if not correct_answer:
+        issues.append("correct_answer 不能为空")
+    if len(explanation) < 60:
+        issues.append("explanation 过短，必须说明解题思路")
+
+    normalized_generated = _normalize_compare_text(generated)
+    normalized_original = _normalize_compare_text(original)
+    if normalized_original and (
+        normalized_generated == normalized_original
+        or normalized_original[:80] in normalized_generated
+    ):
+        issues.append("相似题复制了原题内容")
+
+    forbidden_phrases = [
+        "参考原题",
+        "请围绕",
+        "重新完成一道",
+        "同类型练习题",
+        "更换具体数据或情境",
+        "保持考查点一致",
+    ]
+    if any(phrase in generated for phrase in forbidden_phrases):
+        issues.append("相似题仍然是模板说明，不是真正的新题")
+
+    return issues
+
+
+def _fallback_analysis(question: Dict[str, Any]) -> Dict[str, Any]:
+    text = str(question.get("question_content") or "")
+    inferred_subject, inferred_knowledge = _infer_subject_and_knowledge(text)
+    knowledge = str(question.get("knowledge_point") or inferred_knowledge or "").strip()
+    subject = str(question.get("subject") or inferred_subject or "其他").strip()
+    correct_answer = str(question.get("correct_answer") or "").strip()
+    user_answer = str(question.get("user_answer") or "").strip()
+
+    reason = (
+        f"这道题主要考查{knowledge or subject}。当前答案与正确答案不一致，建议重点核对题意、关键概念和作答步骤。"
+    )
+    if user_answer and correct_answer:
+        reason = f"你的答案与正确答案存在差异，说明对{knowledge or subject}的关键要求把握不够准确。"
+
+    solution = str(question.get("solution") or "").strip()
+    if _is_unparsed_ai_text(solution):
+        solution = ""
+    if not solution:
+        solution = (
+            f"先明确题目考查的核心知识点：{knowledge or subject}；再对照正确答案"
+            f"{f'（{correct_answer}）' if correct_answer else ''}梳理每一步依据，最后总结容易误读或漏掉的条件。"
+        )
+
+    return {
+        "knowledge_points": [knowledge] if knowledge else [],
+        "error_reason": reason,
+        "solution": solution,
+        "related_concepts": [knowledge] if knowledge else [],
+        "difficulty_suggestion": str(question.get("difficulty") or "medium"),
+    }
+
+
+def _fallback_similar_question(question: Dict[str, Any]) -> Dict[str, Any]:
+    text = str(question.get("question_content") or "").strip()
+    knowledge = str(question.get("knowledge_point") or "").strip()
+    subject = str(question.get("subject") or "").strip()
+    correct = str(question.get("correct_answer") or "").strip()
+
+    return {
+        "question_content": (
+            f"请围绕「{knowledge or subject or '同一知识点'}」重新完成一道同类型练习题：\n"
+            f"参考原题：{text[:300]}\n"
+            "要求：更换具体数据或情境，保持考查点一致，并写出完整作答过程。"
+        ),
+        "correct_answer": correct or "请根据新题条件推导正确答案。",
+        "explanation": f"这道练习题用于巩固{knowledge or subject or '原题'}，重点训练识别题意和应用核心方法。",
+        "options": None,
+    }
+
+
+def _raw_llm_display_text(raw: str) -> str:
+    text = _clean_llm_text(_strip_llm_container(raw or ""))
+    if len(text) > 20000:
+        text = text[:20000] + "\n[AI 返回内容过长，已截断]"
+    return text
+
+
+def _analysis_from_raw_llm_text(raw: str, question: Dict[str, Any]) -> Dict[str, Any]:
+    text = _raw_llm_display_text(raw)
+    if not text:
+        return {}
+    knowledge = str(question.get("knowledge_point") or "").strip()
+    return {
+        "knowledge_points": [knowledge] if knowledge else [],
+        "error_reason": text,
+        "solution": text,
+        "related_concepts": [],
+        "difficulty_suggestion": str(question.get("difficulty") or "medium").strip(),
+    }
+
+
+def _similar_from_raw_llm_text(raw: str) -> Dict[str, Any]:
+    text = _raw_llm_display_text(raw)
+    if not text:
+        return {}
+    return {
+        "question_content": text,
+        "correct_answer": "",
+        "explanation": "",
+        "options": None,
+    }
+
+
+def _clean_analysis(parsed: Dict[str, Any], question: Dict[str, Any]) -> Dict[str, Any]:
+    knowledge_points = [_clean_llm_text(item) for item in _listify_text(parsed.get("knowledge_points"))]
+    knowledge_points = [item for item in knowledge_points if item]
+    if not knowledge_points and question.get("knowledge_point"):
+        knowledge_points = [_clean_llm_text(question.get("knowledge_point"))]
+
+    related_concepts = [_clean_llm_text(item) for item in _listify_text(parsed.get("related_concepts"))]
+    related_concepts = [item for item in related_concepts if item]
+
+    error_reason = _clean_llm_text(parsed.get("error_reason"))
+    solution = _clean_llm_text(parsed.get("solution"))
+    if _is_unparsed_ai_text(solution):
+        solution = ""
+
+    return {
+        "knowledge_points": knowledge_points,
+        "error_reason": error_reason,
+        "solution": solution,
+        "related_concepts": related_concepts,
+        "difficulty_suggestion": _clean_llm_text(parsed.get("difficulty_suggestion") or question.get("difficulty") or "medium"),
+    }
+
+
+def _clean_similar_question(parsed: Dict[str, Any], question: Dict[str, Any]) -> Dict[str, Any]:
+    options = parsed.get("options")
+    if isinstance(options, list):
+        options = [_clean_llm_text(item) for item in options if _clean_llm_text(item)]
+    else:
+        options = None
+
+    return {
+        "question_content": _clean_llm_text(parsed.get("question_content")),
+        "correct_answer": _clean_llm_text(parsed.get("correct_answer")),
+        "explanation": _clean_llm_text(parsed.get("explanation")),
+        "options": options,
+    }
+
+
+def _clean_extracted_question(parsed: Dict[str, Any], fallback_text: str = "") -> Dict[str, Any]:
+    cleaned: Dict[str, Any] = {
+        "subject": str(parsed.get("subject") or "").strip(),
+        "knowledge_point": str(parsed.get("knowledge_point") or "").strip(),
+        "question_content": str(parsed.get("question_content") or "").strip(),
+        "user_answer": str(parsed.get("user_answer") or "").strip(),
+        "correct_answer": str(parsed.get("correct_answer") or "").strip(),
+        "error_type": str(parsed.get("error_type") or "other").strip() or "other",
+        "difficulty": str(parsed.get("difficulty") or "medium").strip() or "medium",
+        "error_analysis": str(parsed.get("error_analysis") or "").strip(),
+        "solution": str(parsed.get("solution") or "").strip(),
+    }
+
+    if not cleaned["question_content"] and fallback_text:
+        cleaned["question_content"] = fallback_text.strip()[:500]
+
+    source_text = "\n".join(
+        part for part in [cleaned["question_content"], fallback_text] if part
+    )
+    inferred_subject, inferred_knowledge = _infer_subject_and_knowledge(source_text)
+    cleaned["subject"] = _normalize_subject(cleaned["subject"], source_text) or inferred_subject
+
+    if inferred_knowledge and (
+        not cleaned["knowledge_point"] or cleaned["knowledge_point"] in {"算法", "数据结构", "题目理解", "其他"}
+    ):
+        cleaned["knowledge_point"] = inferred_knowledge
+
+    if cleaned["error_type"] not in {
+        "concept_misunderstanding",
+        "calculation_error",
+        "misreading",
+        "careless",
+        "strategy_error",
+        "other",
+    }:
+        cleaned["error_type"] = "other"
+
+    if cleaned["difficulty"] not in {"easy", "medium", "hard"}:
+        cleaned["difficulty"] = "medium"
+
+    return cleaned
+
+
+@router.post("/wrong-questions/extract", response_model=Dict[str, Any])
+async def ai_extract_question(request: Request):
+    """从粘贴的文本中 AI 提取结构化错题信息，用于自动填充表单。"""
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="文本内容不能为空")
+
+    raw = await asyncio.to_thread(_run_llm, _EXTRACT_INSTRUCTIONS, text, 2048)
+
+    try:
+        parsed = _clean_extracted_question(_parse_llm_json(raw), text)
+    except (json.JSONDecodeError, ValueError):
+        parsed = _clean_extracted_question({}, text)
+
+    return {"raw_text": text, "extracted": parsed}
+
+
+@router.post("/wrong-questions/upload", response_model=Dict[str, Any])
+async def upload_question_file(request: Request):
+    """上传图片/PDF/Word 文件（base64 编码），解析后 AI 自动提取结构化错题信息。
+
+    请求体 JSON: { file_data: "base64...", filename: "xxx.pdf", content_type: "application/pdf", field_type: "question" }
+    field_type 可选值: question(题目), correct_answer(正确答案), user_answer(错误答案)
+    返回 { raw_text, extracted, field_type, file_path }，前端用 extracted 自动填充表单。
+    """
+    import base64
+
+    body = await request.json()
+    file_data = body.get("file_data") or ""
+    filename = body.get("filename") or ""
+    content_type = body.get("content_type") or ""
+    field_type = body.get("field_type") or "question"
+
+    if not file_data:
+        raise HTTPException(status_code=400, detail="文件数据为空")
+
+    try:
+        file_bytes = base64.b64decode(file_data)
+    except Exception:
+        raise HTTPException(status_code=400, detail="文件 base64 解码失败")
+
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="文件为空")
+
+    # 保存文件到本地，返回相对路径供前端存储
+    temp_id = _generate_id()
+    file_path = _save_file(file_data, filename, temp_id, field_type)
+
+    raw_text = ""
+
+    # 图片：使用 LLM vision 识别
+    if content_type.startswith("image/") or filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")):
+        mime = content_type or "image/png"
+        image_b64 = base64.b64encode(file_bytes).decode("utf-8")
+
+        if field_type == "question":
+            prompt = (
+                "请识别图片中的题目内容，提取所有文字信息，包括题目、选项、答案等。\n"
+                "请完整输出识别到的文字内容，保持原始格式。"
+            )
+        elif field_type == "correct_answer":
+            prompt = "请识别图片中的正确答案内容，提取所有文字信息。"
+        else:
+            prompt = "请识别图片中的答案内容，提取所有文字信息。"
+
+        raw_text = await asyncio.to_thread(_run_vision_llm, image_b64, mime, prompt, 2048)
+
+    # PDF
+    elif content_type == "application/pdf" or filename.lower().endswith(".pdf"):
+        raw_text = _parse_pdf(file_bytes)
+
+    # Word
+    elif content_type in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",) or filename.lower().endswith(".docx"):
+        raw_text = _parse_docx(file_bytes)
+
+    # 纯文本
+    elif content_type.startswith("text/") or filename.lower().endswith(".txt"):
+        raw_text = file_bytes.decode("utf-8", errors="replace")
+
+    else:
+        raise HTTPException(status_code=400, detail=f"不支持的文件类型: {content_type or filename}")
+
+    if not raw_text.strip():
+        raise HTTPException(status_code=422, detail="文件解析结果为空，请确认文件内容或手动录入")
+
+    # AI 结构化提取（只有题目需要完整提取，答案只提取文本）
+    if field_type == "question":
+        raw = await asyncio.to_thread(_run_llm, _EXTRACT_INSTRUCTIONS, raw_text, 2048)
+
+        try:
+            parsed = _clean_extracted_question(_parse_llm_json(raw), raw_text)
+        except (json.JSONDecodeError, ValueError):
+            parsed = _clean_extracted_question({}, raw_text)
+    else:
+        parsed = {
+            "subject": "",
+            "knowledge_point": "",
+            "question_content": "",
+            "user_answer": raw_text if field_type == "user_answer" else "",
+            "correct_answer": raw_text if field_type == "correct_answer" else "",
+            "error_type": "other",
+            "difficulty": "medium",
+            "error_analysis": "",
+            "solution": "",
+        }
+
+    return {"raw_text": raw_text, "extracted": parsed, "field_type": field_type, "file_path": file_path}
+
+
+@router.get("/wrong-questions/files/{file_name}/data-url", response_model=Dict[str, Any])
+async def get_question_file_data_url(request: Request, file_name: str):
+    """Return a wrong-question attachment as a JSON data URL for Desktop."""
+    file_path = _FILES_DIR / file_name
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    data = base64.b64encode(file_path.read_bytes()).decode("ascii")
+    return {
+        "file_name": file_path.name,
+        "mime_type": mime_type,
+        "data_url": f"data:{mime_type};base64,{data}",
+    }
+
+
+@router.get("/wrong-questions/files/{file_name}")
+async def download_question_file(request: Request, file_name: str):
+    """下载错题关联的原始文件。"""
+    file_path = _FILES_DIR / file_name
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    from fastapi.responses import FileResponse
+
+    return FileResponse(file_path, filename=file_name)

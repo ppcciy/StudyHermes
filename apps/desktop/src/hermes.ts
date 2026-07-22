@@ -1578,8 +1578,9 @@ export interface WrongQuestion {
   error_analysis: string
   solution: string
   tags: string[]
-  image_path: string | null
-  source_file: string | null
+  question_file: string | null
+  correct_answer_file: string | null
+  user_answer_file: string | null
   created_at: string
   updated_at: string
   review_count: number
@@ -1611,6 +1612,46 @@ export interface ReviewQuestionResponse {
   next_review_at: string
 }
 
+export interface QuestionAnalysis {
+  knowledge_points: string[]
+  error_reason: string
+  solution: string
+  related_concepts: string[]
+  difficulty_suggestion: string
+}
+
+export interface AnalyzeQuestionResponse {
+  question_id: string
+  analysis: QuestionAnalysis
+}
+
+export interface SimilarQuestion {
+  id: string
+  original_question_id: string
+  question_content: string
+  correct_answer: string
+  explanation: string
+  options: string[] | null
+  created_at: string
+}
+
+export interface WrongQuestionReport {
+  subject: string | null
+  total_questions: number
+  total_reviews: number
+  accuracy: number
+  by_knowledge: Record<string, number>
+  by_error_type: Record<string, number>
+  by_mastery: Record<string, number>
+  report: {
+    summary: string
+    weak_points: string[]
+    error_patterns: string[]
+    suggestions: string[]
+    review_plan: string
+  }
+}
+
 export function getWrongQuestions(params?: {
   subject?: string
   knowledge_point?: string
@@ -1639,14 +1680,14 @@ export function getWrongQuestions(params?: {
 export function getWrongQuestionStats(): Promise<WrongQuestionStats> {
   return window.hermesDesktop.api<WrongQuestionStats>({
     ...profileScoped(),
-    path: '/api/learning/wrong-questions/stats'
+    path: '/api/learning/wrong-question-stats'
   })
 }
 
 export function getQuestionsNeedReview(): Promise<WrongQuestion[]> {
   return window.hermesDesktop.api<WrongQuestion[]>({
     ...profileScoped(),
-    path: '/api/learning/wrong-questions/need-review'
+    path: '/api/learning/wrong-questions-need-review'
   })
 }
 
@@ -1661,6 +1702,9 @@ export function createWrongQuestion(data: {
   error_analysis?: string
   solution?: string
   tags?: string[]
+  question_file?: string | null
+  correct_answer_file?: string | null
+  user_answer_file?: string | null
 }): Promise<WrongQuestion> {
   return window.hermesDesktop.api<WrongQuestion>({
     ...profileScoped(),
@@ -1693,5 +1737,114 @@ export function reviewWrongQuestion(questionId: string, data: ReviewQuestionRequ
     path: `/api/learning/wrong-questions/${encodeURIComponent(questionId)}/review`,
     method: 'POST',
     body: data
+  })
+}
+
+export function analyzeWrongQuestion(questionId: string): Promise<AnalyzeQuestionResponse> {
+  return window.hermesDesktop.api<AnalyzeQuestionResponse>({
+    ...profileScoped(),
+    path: `/api/learning/wrong-questions/${encodeURIComponent(questionId)}/analyze`,
+    method: 'POST',
+    timeoutMs: 300000
+  })
+}
+
+export function generateSimilarQuestion(questionId: string): Promise<SimilarQuestion> {
+  return window.hermesDesktop.api<SimilarQuestion>({
+    ...profileScoped(),
+    path: `/api/learning/wrong-questions/${encodeURIComponent(questionId)}/similar`,
+    method: 'POST',
+    timeoutMs: 300000
+  })
+}
+
+export function getSimilarQuestions(questionId: string): Promise<SimilarQuestion[]> {
+  return window.hermesDesktop.api<SimilarQuestion[]>({
+    ...profileScoped(),
+    path: `/api/learning/wrong-questions/${encodeURIComponent(questionId)}/similar`
+  })
+}
+
+export function getWrongQuestionReport(subject?: string): Promise<WrongQuestionReport> {
+  const query = new URLSearchParams()
+  if (subject) query.set('subject', subject)
+  const qs = query.toString()
+  return window.hermesDesktop.api<WrongQuestionReport>({
+    ...profileScoped(),
+    path: `/api/learning/wrong-question-report${qs ? `?${qs}` : ''}`,
+    timeoutMs: 300000
+  })
+}
+
+export interface ExtractedQuestion {
+  subject: string
+  knowledge_point: string
+  question_content: string
+  user_answer: string
+  correct_answer: string
+  error_type: string
+  difficulty: string
+  error_analysis: string
+  solution: string
+}
+
+export interface UploadQuestionResponse {
+  raw_text: string
+  extracted: ExtractedQuestion
+  field_type: string
+  file_path: string
+}
+
+export interface WrongQuestionFileDataUrl {
+  file_name: string
+  mime_type: string
+  data_url: string
+}
+
+export function getWrongQuestionFileDataUrl(filePath: string): Promise<WrongQuestionFileDataUrl> {
+  const fileName = filePath.split(/[\\/]/).filter(Boolean).pop() || filePath
+
+  return window.hermesDesktop.api<WrongQuestionFileDataUrl>({
+    ...profileScoped(),
+    path: `/api/learning/wrong-questions/files/${encodeURIComponent(fileName)}/data-url`
+  })
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = reader.result as string
+      const base64 = result.includes(',') ? result.split(',')[1] : result
+      resolve(base64)
+    }
+    reader.onerror = reject
+    reader.readAsDataURL(file)
+  })
+}
+
+export async function uploadQuestionFile(file: File, fieldType: 'question' | 'correct_answer' | 'user_answer' = 'question'): Promise<UploadQuestionResponse> {
+  const fileData = await fileToBase64(file)
+  return window.hermesDesktop.api<UploadQuestionResponse>({
+    ...profileScoped(),
+    path: '/api/learning/wrong-questions/upload',
+    method: 'POST',
+    body: {
+      file_data: fileData,
+      filename: file.name,
+      content_type: file.type || '',
+      field_type: fieldType,
+    },
+    timeoutMs: 300000,
+  })
+}
+
+export function extractQuestionFromText(text: string): Promise<UploadQuestionResponse> {
+  return window.hermesDesktop.api<UploadQuestionResponse>({
+    ...profileScoped(),
+    path: '/api/learning/wrong-questions/extract',
+    method: 'POST',
+    body: { text },
+    timeoutMs: 120000,
   })
 }
