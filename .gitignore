@@ -158,5 +158,4 @@ apps/desktop/tmp-user-data/
 # Log files
 *.log
 
-# Learning skills temp directories
-skills/learning/hermeslearn-*/
+
